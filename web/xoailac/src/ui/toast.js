@@ -14,18 +14,33 @@ export function stars(n, size = 16) {
 
 export function mountToasts({ toastRoot, sceneUi }) {
   // ---------------------------------------------------------------- toasts
+  // Three levels: 'info' (small, short), 'bad'/'good' (important), 'big' (quest done / unlock / reward: louder, short).
+  // At most 2 on screen; a toast with the same key (or the same text) updates in place instead of stacking.
   const live = [];
-  ctx.toast = (text, kind = 'info', icon = null) => {
+  const LIFE = { info: 2200, good: 2600, bad: 3000, big: 3200 };
+  const RANK = { info: 0, good: 1, bad: 2, big: 3 };
+  ctx.toast = (text, kind = 'info', icon = null, key = null) => {
     if (!text) return;
-    // de-dupe identical toast already visible
-    const dup = live.find((t) => t.text === text);
-    if (dup) { dup.el.classList.remove('pop'); void dup.el.offsetWidth; dup.el.classList.add('pop'); clearTimeout(dup.timer); dup.timer = setTimeout(() => drop(dup), 2600); return; }
-    const el = h('div', { class: 'toast ' + kind, role: 'status' }, icon ? ico(icon, 32) : null, span('', text));
+    const life = LIFE[kind] || 2600;
+    const dup = live.find((t) => (key && t.key === key) || t.text === text);
+    if (dup) {
+      if (dup.text !== text) { dup.text = text; dup.label.textContent = text; }
+      dup.el.className = 'toast ' + kind;
+      dup.el.classList.remove('pop'); void dup.el.offsetWidth; dup.el.classList.add('pop');
+      clearTimeout(dup.timer); dup.timer = setTimeout(() => drop(dup), life);
+      return;
+    }
+    const label = span('', text);
+    const el = h('div', { class: 'toast ' + kind, role: 'status' }, icon ? ico(icon, 32) : null, label);
     toastRoot.appendChild(el);
-    const rec = { el, text, timer: 0 };
+    const rec = { el, text, key, kind, label, timer: 0 };
     live.push(rec);
-    while (live.length > 2) drop(live[0]);
-    rec.timer = setTimeout(() => drop(rec), 2600);
+    while (live.length > 2) {                       // make room: drop the least important (oldest first)
+      let worst = live[0];
+      for (const t of live) if ((RANK[t.kind] || 0) < (RANK[worst.kind] || 0)) worst = t;
+      drop(worst === rec ? live[0] : worst);
+    }
+    rec.timer = setTimeout(() => drop(rec), life);
   };
   function drop(rec) {
     const i = live.indexOf(rec); if (i < 0) return;
@@ -48,9 +63,10 @@ export function mountToasts({ toastRoot, sceneUi }) {
         div('av', ico(m.tip ? 'ui_info' : 'ui_mom', 32)),
         div('bd', div('who', m.who || (m.tip ? 'Mẹo nhỏ' : 'Má nhắn'), m.tip ? null : h('i', null, 'vừa xong')), h('p', null, rich(m.text))));
       momWrap.appendChild(el);
+      relayout();
       if (m.tip) sfx('pop');                  // real Má messages are voiced by the audio module (mom event)
       let closed = false;
-      const close = () => { if (closed) return; closed = true; clearTimeout(t); el.classList.add('out'); setTimeout(() => { el.remove(); momShown--; setTimeout(pump, 200); }, 300); };
+      const close = () => { if (closed) return; closed = true; clearTimeout(t); el.classList.add('out'); setTimeout(() => { el.remove(); momShown--; relayout(); setTimeout(pump, 200); }, 300); };
       const t = setTimeout(close, Math.max(5000, m.text.length * 55));
       el.addEventListener('pointerdown', close);
     }
@@ -78,15 +94,34 @@ export function mountToasts({ toastRoot, sceneUi }) {
     if (banEl) { banEl.remove(); clearTimeout(banT); }
     const el = div('banner' + (kind === 'gold' ? ' gold' : ''), text);
     sceneUi.appendChild(el); banEl = el;
-    banT = setTimeout(() => { el.classList.add('out'); setTimeout(() => el.remove(), 300); if (banEl === el) banEl = null; }, ms);
+    relayout();
+    banT = setTimeout(() => { el.classList.add('out'); setTimeout(() => { el.remove(); relayout(); }, 300); if (banEl === el) banEl = null; }, ms);
   };
+
+  // v2.6.15: Má's note, the banner and the toast chips never sit on top of each other: the banner goes right under
+  // Má's note (when there is one), the toast chips under both. Positions are in px inside the scene.
+  function relayout() {
+    try {
+      // offset* ignore the slide-in transforms, so the numbers are the settled layout
+      const mom = momWrap.querySelector('.mom:not(.out)');
+      let y = mom ? momWrap.offsetTop + mom.offsetTop + mom.offsetHeight + 6 : 0;
+      if (banEl && banEl.isConnected) {
+        banEl.style.top = y ? Math.round(y + 2) + 'px' : '';
+        y = banEl.offsetTop + banEl.offsetHeight + 8;
+      }
+      const wrap = sceneUi.offsetParent === toastRoot.offsetParent ? 0 : (sceneUi.parentElement?.offsetTop || 0);
+      toastRoot.style.top = Math.round(wrap + Math.max(30, y)) + 'px';
+    } catch (e) { /* layout only */ }
+  }
+
 
   // ---------------------------------------------------------------- game events
   const g = ctx.game;
   const on = (e, f) => g.on(e, (p) => { try { f(p || {}); } catch (err) { console.error('[ui] event ' + e, err); } });
-  on('toast', (p) => ctx.toast(p.text, p.kind || 'info', p.icon));
+  on('toast', (p) => ctx.toast(p.text, p.kind || 'info', p.icon, p.key || null));
   on('mom', (p) => ctx.mom(p.text));
-  on('review', (p) => { const r = p.review || p; if (r && (r.stars >= 4 || r.stars <= 2)) ctx.reviewPop(r); });
+  // in-scene stars already show every review; the card pops only for bad ones and special guests' good ones
+  on('review', (p) => { const r = p.review || p; if (r && (r.stars <= 2 || (r.stars >= 5 && C.CUSTOMERS[r.kind]?.special))) ctx.reviewPop(r); });
   on('rush', (p) => { if (p.on) ctx.banner('GIỜ CAO ĐIỂM! KHÁCH ĐÔNG!', 'red'); });
   on('lotteryLady', (p) => { if (p.on) ctx.toast('Cô bán vé số ghé quán kìa — chạm vào cô nha!', 'info', 'ui_ticket'); });
   on('stockLow', (p) => ctx.toast(`Sắp hết ${ING[p.ing]?.name?.toLowerCase() || 'hàng'} rồi!`, 'bad', ING[p.ing]?.icon));
@@ -98,9 +133,21 @@ export function mountToasts({ toastRoot, sceneUi }) {
     ctx.toast(`${p.staff?.name || 'Nhân viên'} lên cấp! ${nm} +1`, 'good', 'ui_up');
   });
   on('questReady', (p) => {
-    ctx.toast(p.kind === 'main' ? 'Mục tiêu xong rồi — bấm nhận thưởng nha!' : 'Nhiệm vụ ngày xong rồi — qua Quán nhận rương nha!', 'good', 'ui_gift');
+    // v2.6.14: short, so the corner chip stays one line
+    ctx.toast(p.kind === 'main' ? 'Xong mục tiêu! Bấm để nhận' : p.kind === 'v2' ? 'Xong việc Sổ tay! Nhận ở Quán' : 'Xong nhiệm vụ ngày! Nhận rương ở Quán', 'big', 'ui_gift');
     sfx('ting');
   });
-  on('combo', (p) => { if (p.n >= 3) ctx.toast(`Combo x${p.n}!`, 'good', 'ui_fire'); });
-  on('comboBreak', (p) => { if (p.n >= 3) ctx.toast('Đứt combo rồi, cố lại nha!', 'info', 'emo_sweat'); });
+  // the scene already floats "Combo xN" over the customer: the toast only marks milestones, as one updating pill
+  on('combo', (p) => { if (p.n >= 5 && p.n % 5 === 0) ctx.toast(`Combo x${p.n}!`, 'good', 'ui_fire', 'combo'); });
+  on('comboBreak', (p) => { if (p.n >= 5) ctx.toast(`Đứt combo x${p.n}, cố lại nha!`, 'info', 'emo_sweat', 'combo'); });
+  // v2 systems
+  const SUP = Object.fromEntries(C.SUPPLIES.map((x) => [x.id, x]));
+  on('supplyLow', (p) => ctx.toast(`Sắp hết ${SUP[p.id]?.name?.toLowerCase() || 'vật tư'} — nhập thêm ở Kho nha.`, 'info', SUP[p.id]?.icon, 'sup_' + p.id));
+  on('supplyOut', (p) => ctx.toast(SUP[p.id]?.need === 'optional' ? `Hết ${SUP[p.id]?.name?.toLowerCase()} — khách hơi phiền đó!`
+    : (C.CONTAINER_IDS || []).includes(p.id) ? `Hết ${SUP[p.id]?.name?.toLowerCase()}! Món sẽ đựng bằng loại còn lại.`      // v2.6.14 ly ↔ hộp
+    : `Hết ${SUP[p.id]?.name?.toLowerCase() || 'vật tư'}! Món cần nó tạm ngưng bán.`, 'bad', SUP[p.id]?.icon, 'sup_' + p.id));
+  on('priceLeave', (p) => ctx.toast(`Khách chê đắt, bỏ đi (${p.n} lượt hôm nay)`, 'info', 'emo_money', 'priceLeave'));
+  on('orderPlaced', (p) => { const sp = C.SUPPLIERS.find((x) => x.id === p.order?.sup); ctx.toast(`Đã đặt hàng ${sp ? sp.name : ''} — đang giao tới`, 'info', sp?.icon || 'eq_truck', 'order'); });
+  on('staffWarn', (p) => ctx.toast(`${p.staff?.name || 'Nhân viên'} muốn nghỉ việc! Xem mục Nhân viên nha.`, 'bad', 'ui_staff', 'staff_' + p.staff?.id));
+  on('staffStay', (p) => ctx.toast(`${p.staff?.name || 'Nhân viên'} vui vẻ ở lại làm tiếp!`, 'good', 'ui_heart', 'staff_' + p.staff?.id));
 }

@@ -2,15 +2,21 @@
 // Every worker is an actor with an explicit task object (no closures) so a tick allocates nothing.
 import * as C from '../config.js';
 import { makeActor, removeActor, stepActor, walkTo } from './world.js';
-import { UP, mods, consumeIngredient, featureUnlocked, ING } from './economy.js';
-import { findTicket, missingIngredients, needsDrinks } from './kitchen.js';
+import { UP, mods, consumeIngredient, featureUnlocked, ING, perkFx } from './economy.js';
+import { findTicket, missingIngredients, needsDrinks, needsSides, putSides } from './kitchen.js';
 import { onTicketServed, collectCoins } from './customers.js';
 import { staffJob } from './staff.js';
 
 // ───────────── speed helpers ─────────────
 export const managing = (G) => G.state.ownerMode === 'manage' && featureUnlocked(G, 'manageMode');
+/** Mood band of a staff member: 'good' | 'ok' | 'bad' | 'risk' (C.MOOD.levels). */
+export function moodBand(m) {
+  const v = typeof m.mood === 'number' ? m.mood : C.MOOD.start;
+  for (const [min, , key] of C.MOOD.levels) if (v >= min) return key;
+  return 'risk';
+}
 export function staffSpeed(G, m) {
-  let f = C.STAFF.speedMult(m.spd);
+  let f = C.STAFF.speedMult(m.spd) * (C.MOOD.speed[moodBand(m)] || 1) * perkFx(G).staffSpeed;   // unhappy (unpaid) staff drag their feet · Lv 27 Quản lý ca
   if (m.trait === 'nhanh') f *= 1.2;
   else if (m.trait === 'vung') f *= 0.9;
   if (managing(G)) f *= 1 + C.STAFF.managerBonus;
@@ -23,7 +29,7 @@ function staffWalk(G, m) {
   if (managing(G)) f *= 1 + C.STAFF.managerBonus;
   return f;
 }
-const prepTime = (G, m) => C.OWNER.chefPrepPerIngredient / (staffSpeed(G, m) * (1 + G.state.upgrades.knife * UP.knife.speedPer));
+const prepTime = (G, m) => C.OWNER.chefPrepPerIngredient / (staffSpeed(G, m) * (1 + G.state.upgrades.knife * UP.knife.speedPer) * perkFx(G).prepSpeed);
 
 // ───────────── actors ─────────────
 function homeOf(G, m) {
@@ -304,13 +310,19 @@ function tickChef(G, a, m, dtMin, open) {
           warnOut(G, ing);
           return;
         }
-        if (!(m.trait === 'tietkiem' && G.rng.chance(0.1))) consumeIngredient(G, ing, 1);
+        if (!(m.trait === 'tietkiem' && G.rng.chance(0.1))) { const q = consumeIngredient(G, ing, 1); t.qSum = (t.qSum || 0) + (q || 0); t.qN = (t.qN || 0) + 1; }
         t.added[ing] = 1;
         G.emit('ingredientAdded', { ing, complete: miss.length === 1, ticketId: t.id, by: 'staff' });
         tk.timer += prepTime(G, m);
       } else if (needsDrinks(t)) {
         t.drinksAdded = true;
         G.emit('drinksAdded', { ticketId: t.id, by: 'staff' });
+        tk.timer += prepTime(G, m) * 0.5;
+      } else if (needsSides(t)) {
+        if (!putSides(G, t)) {                           // a side ran out: the order goes on without it
+          t.sides = []; t.sidesAdded = true; const g = (G.world.groups || []).find((x) => x.id === t.groupId); if (g) g.sides = [];
+        }
+        G.emit('sidesAdded', { ticketId: t.id, by: 'staff' });
         tk.timer += prepTime(G, m) * 0.5;
       } else {
         t.status = 'ready'; t.claimedBy = 0; t.readyAt = w.tMin;

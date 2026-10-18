@@ -6,7 +6,7 @@ import { route } from './routing.js';
 import { makeActor, removeActor, setPath, stepActor, nid } from './world.js';
 import {
   POT, ING, DRINK, MARKETING_BY_ID, UP, tierDef, eventDef, mods, ambienceOf, potPrice, addMoney, spend, addXp,
-  isPotUnlocked, isDrinkUnlocked, featureUnlocked,
+  isPotUnlocked, isDrinkUnlocked, featureUnlocked, sellPrice, priceRatio, menuPriceDemand, useSupply, perkFx, SIDES, isSideUnlocked, consumeIngredient,
 } from './economy.js';
 import { createTicket, removeTicket, ticketRecipe } from './kitchen.js';
 import { scoreGroup, pushRating, makeReview, angryLine } from './rating.js';
@@ -19,7 +19,24 @@ export const CUSTOMER_WALK = 17; // px per game minute
 export function marketingDemand(G) {
   let m = 1;
   const mt = G.state.marketingToday;
-  for (const id in mt) if (mt[id]) { const d = MARKETING_BY_ID[id]; if (d && d.demand) m *= d.demand; }
+  const hour = Math.floor(G.state.clock / 60);
+  for (const id in mt) if (mt[id]) { const d = MARKETING_BY_ID[id]; if (d && d.demand && inHours(d, hour, G)) m *= d.demand; }
+  return m;
+}
+/** Marketing with an hour window (Giờ vàng) only works inside it. */
+export const inHours = (d, hour, G) => {
+  if (!d.hours) return true;
+  const from = d.id === 'giovang' && G && perkFx(G).goldenFrom != null ? Math.min(d.hours[0], perkFx(G).goldenFrom) : d.hours[0];   // Lv 37: from 13h
+  return hour >= from && hour < d.hours[1];
+};
+function marketingDrinkChance(G) {
+  let c = 0;
+  for (const id in G.state.marketingToday) if (G.state.marketingToday[id]) { const d = MARKETING_BY_ID[id]; if (d && d.drinkChance) c += d.drinkChance + perkFx(G).comboDrink; }
+  return c;
+}
+function marketingDrinkPrice(G) {
+  let m = 1;
+  for (const id in G.state.marketingToday) if (G.state.marketingToday[id]) { const d = MARKETING_BY_ID[id]; if (d && d.drinkPriceMult) m *= d.drinkPriceMult; }
   return m;
 }
 export function weatherDemand(G) {
@@ -45,6 +62,7 @@ export function demandRate(G) {
   if (ev && ev.id === 'bongda') r *= mods(G).footballMult;
   if (isWeekend(s.day)) r *= C.TIME.weekendMult;
   r *= marketingDemand(G) * s.viral.mult * (s.boost || 1) * mods(G).demand;
+  r *= menuPriceDemand(G);                    // word of mouth: cheap menus pull people in, pricey ones push them away
   return r;
 }
 
@@ -80,12 +98,15 @@ function pickKind(G) {
   let unlocked = 0;
   for (const p of C.HOTPOTS) if (isPotUnlocked(G, p.id)) unlocked++;
   const ids = Object.keys(K);
+  const pf = perkFx(G);
+  const mkKind = (id) => { let x = 1; for (const mid in s.marketingToday) if (s.marketingToday[mid]) { const d = MARKETING_BY_ID[mid]; if (d && d.kinds && d.kinds[id]) x *= d.kinds[id]; } return x; };
   return rng.weighted(ids, (id) => {
     const k = K[id];
     if (!k.weight || k.minTier > s.tier || k.oncePerDay) return 0;
     if (k.special && (w.specialSpawned[id] || 0) >= 1) return 0;
     if (k.special && s.day < 3) return 0;
     let m = k.weight * ((k.hours && k.hours[hour]) ?? 1) * ((ev && ev.kinds && ev.kinds[id]) || 1);
+    m *= (pf.kindDemand[id] || 1) * mkKind(id);   // level perks (Thẻ khách quen, Tour ăn vặt) · Ngày hội học trò
     if (k.likesAmbience) m *= 1 + 1.5 * amb;
     if (k.likesNew) m *= 1 + 0.2 * Math.max(0, unlocked - 2);
     return m;
@@ -105,6 +126,37 @@ const SCRIPT = [
   { at: C.TIME.dayStart + 2, kind: 'sinhvien', size: 2, pot: 'xoailac', drinks: ['trada', 'trada'] },
   { at: C.TIME.dayStart + 40, kind: 'sinhvien', size: 2, pot: 'coclac', drinks: ['trada', 'nuocngot'] },
 ];
+
+/** v2.6.9 Xe máy giao hàng: while the shop is open, app orders come in (perHour × level per game hour). Each one
+ *  takes a portion's fruit and its cup/box + bag from the kho, pays the selling price minus the app's cut, and
+ *  never uses a counter spot. No stock → the order is skipped (counted, so the report can say so). */
+export function deliveryTick(G, dtMin) {
+  const s = G.state, w = G.world, lvl = s.upgrades.delivery || 0;
+  if (!lvl || s.phase !== 'open') return;
+  const D = C.UPGRADES.find((u) => u.id === 'delivery');
+  w.deliveryAcc = (w.deliveryAcc || 0) + (dtMin / 60) * D.perHour * lvl;
+  while (w.deliveryAcc >= 1) {
+    w.deliveryAcc -= 1;
+    const reserved = reservedStock(G);
+    const pots = C.HOTPOTS.filter((p) => s.menu[p.id] && isPotUnlocked(G, p.id) && canMake(G, p.id, reserved));
+    if (!pots.length) { s.today.deliveryMissed = (s.today.deliveryMissed || 0) + 1; continue; }
+    const p = G.rng.pick(pots);
+    for (const i of p.recipe) consumeIngredient(G, i, 1);
+    const box = boxFor(G, p.id, reserved);
+    if (box) { useSupply(G, box, 1); s.stats.packsUsed = (s.stats.packsUsed || 0) + 1; }
+    useSupply(G, 'tui', 1);
+    const base = round2(sellPrice(G, p.id) * (1 - D.appFee));
+    addMoney(G, base, 'delivery');
+    s.today.revenue = round2(s.today.revenue + base);
+    s.today.potsSold++; s.stats.potsSold++;
+    s.today.potsSoldOf[p.id] = (s.today.potsSoldOf[p.id] || 0) + 1;
+    s.stats.potsSoldOf[p.id] = (s.stats.potsSoldOf[p.id] || 0) + 1;
+    s.recipes[p.id].sold++;
+    s.today.delivered = (s.today.delivered || 0) + 1;
+    s.stats.delivered = (s.stats.delivered || 0) + 1;
+    if (s.today.delivered === 1) G.toast('Có đơn giao hàng đầu tiên trong ngày! Xe máy đã chạy đi giao.', 'info', 'eq_moto');
+  }
+}
 
 export function spawnTick(G, dtMin) {
   const s = G.state, w = G.world, rng = G.rng;
@@ -298,7 +350,18 @@ function updateGroup(G, g, dtMin) {
       if (g.timer <= 0) placeOrder(G, g);
       break;
     }
+    case 'toSide': {
+      if (!allArrived(g)) break;
+      g.state = 'eating';
+      g.members.forEach((a) => { a.pose = 'sit'; a.facing = a.seatFace || 'down'; });
+      break;
+    }
     case 'eating': {
+      // counter: done with extras → finish eating at a free side table, the counter spot frees up for the next in line
+      if (w.layout.counter && !g.seated && !closing && !g.plan.length && !g.extraTicket && g.eatLeft > 1.5 && g.tableIdx >= 0) {
+        const st = freeSide(G);
+        if (st) { moveToSide(G, g, st); break; }
+      }
       // counter: while an extra is on its way they just wait for it
       if (!(w.layout.counter && g.extraTicket)) g.eatLeft -= dtMin / (closing ? 0.3 : 1);
       const prog = 1 - g.eatLeft / g.eatTotal;
@@ -311,11 +374,12 @@ function updateGroup(G, g, dtMin) {
         g.plan.shift();
         orderExtra(G, g);
       }
+      if (g.seated) { const sd = w.side[g.sideIdx]; if (sd) sd.fill = clamp(1 - 0.8 * prog, 0.2, 1); }
       if (g.eatLeft <= 0) {
         if (g.extraTicket) { removeTicket(G, g.extraTicket); g.extraTicket = null; g.extrasExpired++; }
         g.state = 'billing'; g.timer = C.TIME.payDelay;
         if (t) { t.boiling = false; t.dirty = true; t.pot = null; t.plates = 0; t.drinks = 0; t.potFill = 0; }
-        g.members.forEach((a) => { a.pose = 'idle'; });
+        if (!g.seated) g.members.forEach((a) => { a.pose = 'idle'; });
       }
       break;
     }
@@ -330,9 +394,12 @@ function updateGroup(G, g, dtMin) {
         if (g.moodT > 0) break;
         g.leaveStarted = true;
         const L = w.layout;
+        if (g.seated) freeSideOf(G, g);
         g.members.forEach((a) => {
           const ex = pickExit(L, a.x);
-          setPath(a, route(L, { x: a.x, y: a.y }, { x: ex.x, y: ex.y }));
+          // from a side table: step back onto the pavement walkway, then off-screen
+          if (g.seated && L.counter) setPath(a, [{ x: a.x, y: a.y }, { x: a.x, y: L.counter.qY - 1 }, { x: ex.x, y: ex.y }]);
+          else setPath(a, route(L, { x: a.x, y: a.y }, { x: ex.x, y: ex.y }));
           a.pose = 'walk';
         });
         break;
@@ -354,22 +421,55 @@ function updateGroup(G, g, dtMin) {
 function reservedStock(G) {
   const r = {};
   for (const t of G.world.tickets) {
-    if (t.status === 'done' || t.status === 'ready' || t.status === 'carrying') continue;
+    if (t.status === 'done' || t.status === 'dead') continue;
+    // supplies are used when the portion is handed over, so every live order holds its container / cups
+    if (!t.extra) {
+      const pk = C.DISH_PACK[t.pot];
+      const box = t.box || (pk && pk.box);                  // v2.6.14: the container chosen for this order
+      if (box) r['$' + box] = (r['$' + box] || 0) + 1;
+      if (t.drinks.length) r.$ly_nuoc = (r.$ly_nuoc || 0) + t.drinks.length;
+    }
+    if (t.status === 'ready' || t.status === 'carrying') continue;
     for (const i of ticketRecipe(t)) if (!t.added[i]) r[i] = (r[i] || 0) + 1;
+    if (!t.extra && !t.sidesAdded) for (const i of t.sides || []) r[i] = (r[i] || 0) + 1;
   }
   return r;
+}
+const supplyLeft = (G, id, reserved) => (G.state.supplies[id] || 0) - (reserved['$' + id] || 0);
+/** v2.6.14: the dish's own container if there is one left, otherwise the other kind (a cup instead of a box…). */
+export function boxFor(G, potId, reserved) {
+  const pk = C.DISH_PACK[potId];
+  if (!pk) return null;
+  const pref = G.state.packPref;                                    // v2.6.19: the shop's chosen container comes first
+  if (pref && supplyLeft(G, pref, reserved) >= 1) return pref;
+  if (supplyLeft(G, pk.box, reserved) >= 1) return pk.box;
+  return C.CONTAINER_IDS.find((id) => id !== pk.box && supplyLeft(G, id, reserved) >= 1) || false;
 }
 function canMake(G, potId, reserved) {
   if (!POT[potId]) return false;
   for (const i of POT[potId].recipe) if ((G.state.inventory[i] || 0) - (reserved[i] || 0) < 1) return false;
+  if (boxFor(G, potId, reserved) === false) return false;           // no cup and no box → this dish cannot be sold
   return true;
 }
+/** Chance this group walks away from `potId` at its current selling price (C.PRICING). */
+export function refuseChance(G, kind, potId) {
+  const P = C.PRICING, k = K[kind], s = G.state;
+  if (!k || !POT[potId]) return 0;
+  const price = sellPrice(G, potId), ref = Math.max(1, potPrice(G, potId));
+  const ev = eventDef(G);
+  const budget = k.budget * (ev && ev.budgetMult && kind === 'vanphong' ? ev.budgetMult : 1);
+  const lvl = (s.recipes[potId] && s.recipes[potId].lvl) || 1;
+  const value = P.valueRating * Math.max(0, s.rating.avg - 4) + P.valueRecipe * (lvl - 1) + perkFx(G).priceValue + mods(G).priceValue;
+  const z = P.overW * (price / ref - P.overC) + P.budW * (price / budget - P.budC) - value;
+  return 1 / (1 + Math.exp(-P.k * z));
+}
+const choiceMult = (G, potId) => clamp(Math.pow(priceRatio(G, potId), -C.PRICING.choiceExp), C.PRICING.choiceMin, C.PRICING.choiceMax);
 
 function placeOrder(G, g) {
   const s = G.state, rng = G.rng, k = K[g.kind];
   const reserved = reservedStock(G);
   const pots = C.HOTPOTS.filter((p) => s.menu[p.id] && isPotUnlocked(G, p.id));
-  const weight = (p) => k.prefers[p.id] ?? 0.5;
+  const weight = (p) => (k.prefers[p.id] ?? 0.5) * choiceMult(G, p.id);
   if (!g.scripted) {
     // dishes whose stock ran out are off the menu until tomorrow (no buying while open)
     let pick = rng.weighted(pots, weight);
@@ -378,6 +478,14 @@ function placeOrder(G, g) {
       if (alt) { g.substitute = true; pick = alt; } else pick = null;
     }
     if (!pick) { soldOutLeave(G, g); return; }
+    // the price on the board: they may find it too dear, look at one other dish, then walk away
+    if (!g.tutorial && !g.reservation && rng.chance(refuseChance(G, g.kind, pick.id))) {
+      bumpRefused(G, pick.id);
+      const others = pots.filter((p) => p.id !== pick.id && canMake(G, p.id, reserved));
+      const alt = rng.weighted(others, weight);
+      if (alt && !rng.chance(refuseChance(G, g.kind, alt.id))) { pick = alt; g.substitute = true; }
+      else { if (alt) bumpRefused(G, alt.id); priceLeave(G, g, pick.id); return; }
+    }
     g.pot = pick.id;
   } else if (!canMake(G, g.pot, reserved)) {
     // scripted tutorial order but stock got wasted: pick something makeable
@@ -389,7 +497,7 @@ function placeOrder(G, g) {
     g.drinks = [];
     if (!g.takeaway) {
       const drinks = C.DRINKS.filter((d) => isDrinkUnlocked(G, d.id));
-      const chance = C.DRINK_CHANCE + s.upgrades.cooler * UP.cooler.drinkChancePer;
+      const chance = C.DRINK_CHANCE + s.upgrades.cooler * UP.cooler.drinkChancePer + marketingDrinkChance(G) + mods(G).drinkChance;
       for (let i = 0; i < g.size; i++) {
         if (!rng.chance(chance)) continue;
         const d = rng.weighted(drinks, (x) => (k.drinks && k.drinks[x.id]) ?? 1);
@@ -397,6 +505,31 @@ function placeOrder(G, g) {
       }
     }
   }
+  // v2.5 món ăn kèm: one (sometimes two) of the unlocked sides that are in stock and not promised to another order
+  if (!g.sides) {
+    g.sides = [];
+    if (!g.tutorial) {
+      const left = (id) => (s.inventory[id] || 0) - (reserved[id] || 0) - g.sides.filter((x) => x === id).length;
+      const pickSide = () => {
+        const av = SIDES.filter((d) => isSideUnlocked(G, d.id) && left(d.id) >= 1);
+        const d = av.length ? rng.weighted(av, (x) => (x.kinds && x.kinds[g.kind]) || 1) : null;
+        if (d) g.sides.push(d.id);
+        return !!d;
+      };
+      // roll only when something is on offer, so shops without sides keep exactly the old random sequence
+      const any = SIDES.some((d) => isSideUnlocked(G, d.id) && left(d.id) >= 1);
+      if (any && rng.chance(C.SIDE_CHANCE.first) && pickSide() && g.size >= 3 && rng.chance(C.SIDE_CHANCE.second)) pickSide();
+    }
+  }
+  // every drink needs a plastic cup: none left → no drinks for this group
+  const cups = Math.max(0, supplyLeft(G, 'ly_nuoc', reserved));
+  if (g.drinks.length > cups) {
+    s.today.supplyMiss.ly_nuoc = (s.today.supplyMiss.ly_nuoc || 0) + (g.drinks.length - cups);
+    g.drinks.length = cups;
+    if (!G.world.supplyWarned || !G.world.supplyWarned['ly_nuoc:out']) { G.world.supplyWarned = G.world.supplyWarned || {}; G.world.supplyWarned['ly_nuoc:out'] = true; G.emit('supplyOut', { id: 'ly_nuoc' }); }
+  }
+  g.price = sellPrice(G, g.pot);   // the price on the board when they ordered is the price they pay
+  g.box = boxFor(G, g.pot, reserved) || null;                      // v2.6.14: cup or box (the player can switch it)
   g.ticket = createTicket(G, g);
   g.state = 'ordered';
   g.deadline = s.phase === 'closing' ? 45 : 0;
@@ -445,11 +578,22 @@ export function onTicketServed(G, t, carrier) {
   g.comboAt = w.comboN;
   const mk = MARKETING_BY_ID;
   let pm = 1;
-  for (const id in s.marketingToday) if (s.marketingToday[id] && mk[id] && mk[id].priceMult) pm *= mk[id].priceMult;
-  g.info = { pot: g.pot, maker: t.maker, waitRatio: ratio, priceMult: pm, combo: w.comboN, shake: t.shake || null, shakeN: t.shake === 'perfect' ? w.shakeN || 1 : 0 };
+  const hourNow = Math.floor(s.clock / 60);
+  for (const id in s.marketingToday) if (s.marketingToday[id] && mk[id] && mk[id].priceMult && inHours(mk[id], hourNow, G)) pm *= mk[id].priceMult;
+  g.info = { pot: g.pot, maker: t.maker, waitRatio: ratio, priceMult: pm, combo: w.comboN, shake: t.shake || null, shakeN: t.shake === 'perfect' ? w.shakeN || 1 : 0,
+    ingQ: t.qN ? t.qSum / t.qN : 0 };
+  // packing: the cup / box (reserved at order time), its skewer or chopsticks, one plastic cup per drink
+  const pk = C.DISH_PACK[g.pot];
+  g.supplyMiss = 0;
+  if (pk) {
+    if (useSupply(G, t.box || pk.box, 1) < 1) g.supplyMiss++;
+    else s.stats.packsUsed = (s.stats.packsUsed || 0) + 1;
+    if (pk.tool && useSupply(G, pk.tool, 1) < 1) g.supplyMiss++;
+  }
+  if (t.drinks.length) useSupply(G, 'ly_nuoc', t.drinks.length);
   // drinks cost is paid when they reach the table
   let dcost = 0;
-  for (const d of t.drinks) dcost += DRINK[d].cost;
+  for (const d of t.drinks) dcost += DRINK[d].cost * mods(G).drinkCostMult;   // v2.6.9: đá viên, máy lọc nước
   if (dcost > 0) spend(G, 'drinks', dcost, 'drinks');
   G.emit('served', { ticketId: t.id, tableIdx: g.tableIdx, fast, x, y });
   if (g.takeaway) { finishGroup(G, g); return; }
@@ -491,25 +635,34 @@ function finishGroup(G, g) {
   const table = g.tableIdx >= 0 ? w.tables[g.tableIdx] : null;
   const L = w.layout;
   const spot = !table && g.doorIdx >= 0 ? L.waitSpots[g.doorIdx] : null;
-  const x = table ? table.x : spot ? spot.x : 0, y = table ? table.y : spot ? spot.y : 0;
+  const side = g.seated ? w.side[g.sideIdx] : null;
+  const x = side ? side.x : table ? table.x : spot ? spot.x : 0, y = side ? side.y : table ? table.y : spot ? spot.y : 0;
+  // a bag for whoever takes the food away, napkins for everybody
+  if (!g.seated && useSupply(G, 'tui', 1) < 1) g.supplyMiss = (g.supplyMiss || 0) + 1;
+  if (useSupply(G, 'khan', 1) < 1) g.supplyMiss = (g.supplyMiss || 0) + 1;
   const sc = scoreGroup(G, g);
   const stars = sc.stars;
   g.stars = stars;
   // money
   const info = g.info || { priceMult: 1, combo: 0 };
   const comboBonus = Math.min(info.combo * C.COMBO.bonusPer, C.COMBO.maxBonus);
-  const potPart = potPrice(G, g.pot) * (info.priceMult || 1) * (1 + comboBonus);
+  const potPart = (g.price != null ? g.price : sellPrice(G, g.pot)) * (info.priceMult || 1) * (1 + comboBonus);
+  if (g.price != null && g.price > potPrice(G, g.pot)) G.counter('priceySold', 1);
   let drinksRev = 0;
   const drinkIds = g.drinks || [];
-  for (const d of drinkIds) drinksRev += DRINK[d].price;
+  const dpm = marketingDrinkPrice(G);
+  for (const d of drinkIds) drinksRev += DRINK[d].price * dpm;
+  const sideIds = g.sides || [];
+  let sidesRev = 0;
+  for (const d of sideIds) sidesRev += (ING[d] && ING[d].side) || 0;
   let tip = tipFor(G, g, stars);
   if (info.shake === 'perfect') tip += Math.max(1, Math.round(potPart * (C.SHAKE.tip + Math.min(C.SHAKE.maxStreakTip, C.SHAKE.streakTip * Math.max(0, (info.shakeN || 1) - 1)))));
-  const base = round2(potPart + drinksRev + g.extraRev);
+  const base = round2(potPart + drinksRev + sidesRev + g.extraRev);
   // rating + XP
   pushRating(G, stars, g.special ? K[g.kind].reviewWeight || 1 : 1);
   s.today.stars += stars; s.today.rated++;
   if (stars >= 5) { s.stats.fiveStars++; s.today.fiveStars++; }
-  addXp(G, C.LEVEL.xpForGroup(potPrice(G, g.pot), g.size, stars, s.tier), x, y - 10);
+  addXp(G, Math.round(C.LEVEL.xpForGroup(potPrice(G, g.pot), g.size, stars, s.tier) * C.LEVEL.serveXpMult(s.level)), x, y - 10);   // v2.6.18
   // review
   const wantsReview = g.special || stars <= 1 || rng.chance(C.RATING.reviewChance);
   let review = null;
@@ -527,13 +680,22 @@ function finishGroup(G, g) {
     else if (stars <= 3) { s.viral = { days: C.VIRAL.days, mult: C.VIRAL.badDemand }; G.mom('reviewerBad'); G.toast('Reviewer chê rồi… khách sẽ giảm vài hôm.', 'bad', 'ui_review'); }
   }
   if (g.kind === 'tiktoker' && stars >= 4) { s.nextBoost = 1.2; G.toast('TikToker khen quán! Mai khách đông hơn +20%.', 'good', 'ui_phone'); }
-  g.coinInfo = { base, tip, amount: round2(base + tip), pot: g.pot, drinks: drinkIds.length, size: g.size, kind: g.kind, stars };
+  g.coinInfo = { base, tip, amount: round2(base + tip), pot: g.pot, drinks: drinkIds.length, sides: sideIds.length, size: g.size, kind: g.kind, stars };
   g.members.forEach((a) => { a.pose = stars >= 5 ? 'cheer' : 'idle'; });
   if (g.takeaway) {
     G.emit('bill', { tableIdx: -1, amount: g.coinInfo.amount, tip, x, y, groupId: g.id });
     payCoins(G, g.coinInfo, 'staff', x, y);
     if (g.doorIdx >= 0) { w.doors[g.doorIdx] = 0; g.doorIdx = -1; }
     startLeaving(G, g, stars >= 5 ? 3.3 : 0.6, false, 'paid');
+    return;
+  }
+  if (side) {
+    // side table: they pay before getting up (straight into the két) and leave
+    G.emit('bill', { tableIdx: -1, amount: g.coinInfo.amount, tip, x, y, groupId: g.id });
+    payCoins(G, g.coinInfo, 'player', x, y - 8, -1);
+    s.today.seated++; s.stats.seated = (s.stats.seated || 0) + 1;
+    g.members.forEach((a) => { a.pose = stars >= 5 ? 'cheer' : 'idle'; });
+    startLeaving(G, g, stars >= 5 ? 2.2 : 0.6, false, 'paid');
     return;
   }
   if (L.counter) {
@@ -573,6 +735,7 @@ function payCoins(G, info, by, x, y, tableIdx = -1) {
   s.stats.potsSoldOf[info.pot] = (s.stats.potsSoldOf[info.pot] || 0) + 1;
   s.recipes[info.pot].sold++;
   s.today.drinksSold += info.drinks; s.stats.drinksSold += info.drinks;
+  if (info.sides) { s.today.sidesSold = (s.today.sidesSold || 0) + info.sides; s.stats.sidesSold = (s.stats.sidesSold || 0) + info.sides; }
   G.emit('collected', { tableIdx, amount: info.amount, x, y, by });
 }
 
@@ -638,6 +801,58 @@ function freeSeat(G, g) {
     const t = w.tables[g.tableIdx];
     if (t && t.groupId === g.id) { t.status = 'free'; t.groupId = 0; resetTableView(t); }
   }
+  if (g.seated) freeSideOf(G, g);
+}
+
+// ───────────── side tables (bàn ghế hai bên quán) ─────────────
+function freeSide(G) {
+  for (const sd of G.world.side) if (!sd.groupId) return sd;
+  return null;
+}
+function freeSideOf(G, g) {
+  const sd = G.world.side[g.sideIdx];
+  if (sd && sd.groupId === g.id) { sd.groupId = 0; sd.pot = null; sd.fill = 0; sd.drinks = 0; }
+}
+/** A served group carries its cups from the counter to a side table; the counter spot is free for the next in line. */
+function moveToSide(G, g, sd) {
+  const w = G.world, L = w.layout;
+  const t = w.tables[g.tableIdx];
+  if (t && t.groupId === g.id) { t.status = 'free'; t.groupId = 0; t.claimedBy = 0; resetTableView(t); }
+  g.tableIdx = -1;
+  g.seated = true; g.sideIdx = sd.idx;
+  sd.groupId = g.id; sd.pot = g.pot; sd.fill = 1; sd.drinks = Math.min(4, (g.drinks || []).length);
+  g.eatLeft *= C.SIDE.eatMult; g.eatTotal = Math.max(g.eatTotal, g.eatLeft);
+  g.state = 'toSide';
+  const mid = L.counter ? L.counter.qY + 4 : sd.y;
+  g.members.forEach((a, i) => {
+    const seat = sd.seats[i % sd.seats.length];
+    setPath(a, [{ x: a.x, y: a.y }, { x: a.x, y: mid }, { x: seat.x, y: mid }, { x: seat.x, y: seat.y }]);
+    a.pose = 'walk'; a.seatFace = seat.facing;
+  });
+  G.emit('seatedSide', { groupId: g.id, idx: sd.idx });
+}
+
+// ───────────── walking away over the price ─────────────
+function bumpRefused(G, potId) {
+  const t = G.state.today;
+  t.priceRefused[potId] = (t.priceRefused[potId] || 0) + 1;
+}
+function priceLeave(G, g, potId) {
+  const s = G.state;
+  s.today.lost++; s.today.priceLost++;
+  g.priceLeave = true;
+  G.emit('priceLeave', { groupId: g.id, pot: potId, n: s.today.priceLost });
+  if (G.rng.chance(C.PRICING.priceyReviewChance)) {
+    pushRating(G, 3, 1);
+    s.today.stars += 3; s.today.rated++;
+    const gg = Object.assign({}, g, { pot: potId });
+    const lines = C.REVIEW_TEXT.tags.pricey;
+    const review = makeReview(G, gg, 3, null, G.rng.pick(lines));
+    G.emit('review', { review, x: g.members[0] ? g.members[0].x : 0, y: g.members[0] ? g.members[0].y : 0, groupId: g.id });
+  }
+  freeSeat(G, g);
+  startLeaving(G, g, 1.2, false, 'price');
+  g.members.forEach((a) => { a.path = null; a.pose = 'idle'; });
 }
 
 export function ticketExpired(G, t) {
@@ -665,4 +880,5 @@ export function resetCustomers(G) {
   w.groups.length = 0; w.tickets.length = 0; w.tray.ticketId = null;
   for (let i = 0; i < w.doors.length; i++) w.doors[i] = 0;
   for (const t of w.tables) { t.status = 'free'; t.groupId = 0; t.coins = null; t.claimedBy = 0; resetTableView(t); }
+  for (const sd of w.side || []) { sd.groupId = 0; sd.pot = null; sd.fill = 0; sd.drinks = 0; }
 }

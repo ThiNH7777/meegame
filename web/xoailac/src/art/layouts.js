@@ -155,25 +155,40 @@ const SCENE_BY_TIER = { 1: 'vihe', 2: 'hem', 3: 'mapho', 4: 'haitang', 5: 'haita
 // `tables` are the counter spots (ô quầy) and keep the sim's table schema; `waitSpots` are the queue places.
 export const COUNTER = { w: 200, h: 150, ground: 70, qY: 88, top: 114, feet: 123, slotW: 48 };
 const CSEATS = [[0, 0], [-12, -3], [12, -3], [-5, -6]];   // leader at the counter, friends peeking from behind
-const OFF = { x: 100, y: 176 };   // behind the camera: owner / staff / stoves (not drawn)
+const OFF = { x: 100, y: 176 };
+// One row on the pavement, 46+ px apart so tables and stools never overlap (footprint ≈ 44 × 35 world px),
+// leaving a walkway down the middle (x 92–108) from the queue to the counter. Build order: left, right, inner left, inner right.
+export const SIDE_SPOTS = [[24, 95], [176, 95], [70, 95], [130, 95]];
+// v2.5.2: a long bar along the railing at the back-left (the queue keeps the back-right), four stools facing the
+// view; it is the 5th side "table" (bought last). Ledge from x 10 to 86 at y 73, guests sit with their backs to us.
+// v2.6.4: centred on the railing, in the gap between the two inner side tables; 4 modern bar stools
+export const BAR = { x: 100, y: 78, ledgeY: 72, x0: 75, x1: 125, seatsX: [82, 94, 106, 118] };   // behind the camera: owner / staff / stoves (not drawn)
 function counterLayout(scene, nSlots, nStoves) {
   const C0 = COUNTER;
   const tables = [];
+  const slotW = nSlots >= 5 ? 40 : C0.slotW;      // v2.5.2: a 5th spot fits once the counter ends are clear
   for (let i = 0; i < nSlots; i++) {
-    const x = Math.round(C0.w / 2 + (i - (nSlots - 1) / 2) * C0.slotW);
+    const x = Math.round(C0.w / 2 + (i - (nSlots - 1) / 2) * slotW);
     tables.push({ x, y: C0.top, floor: 1, seats: CSEATS.map(([dx, dy]) => ({ x: x + dx, y: C0.feet + dy, facing: 'down' })) });
   }
   const waitSpots = [];
-  for (let i = 0; i < 8; i++) waitSpots.push({ x: Math.round(124 + i * 14), y: Math.round(C0.qY - i * 1.5), facing: 'left' });
+  // v2: the queue stands further back (pavement behind the side tables)
+  // the queue starts at the walkway behind the side tables and runs right/back along the shop front
+  // v2.6.4: the bar now takes the middle of the railing, so the line forms to its right (5 places), then its left
+  for (let i = 0; i < 5; i++) waitSpots.push({ x: 140 + i * 13, y: Math.round(C0.qY - 9 - i * 0.5), facing: 'left' });
+  for (let i = 0; i < 3; i++) waitSpots.push({ x: 60 - i * 13, y: Math.round(C0.qY - 9 - i * 0.5), facing: 'right' });
+  // side tables on the pavement, either side of the counter (build order: left, right, left, right, back-left, back-right)
+  const side = SIDE_SPOTS.map(([x, y], i) => ({ idx: i, x, y, seats: SEAT.map((q) => ({ x: x + q.dx, y: y + q.dy, facing: q.facing })) }));
+  side.push({ idx: side.length, x: BAR.x, y: BAR.y, bar: true, seats: BAR.seatsX.map((sx) => ({ x: sx, y: BAR.y + 1, facing: 'up' })) });   // seats sort just in front of the ledge
   const stoves = [], chefSpots = [];
   for (let i = 0; i < Math.max(1, nStoves); i++) { stoves.push({ x: OFF.x, y: OFF.y, sortY: OFF.y }); chefSpots.push({ x: OFF.x, y: OFF.y, facing: 'down' }); }
   return {
-    scene, w: C0.w, h: C0.h, counter: C0,
+    scene, w: C0.w, h: C0.h, counter: { ...C0, slotW },
     lane: { y: 64 }, street: null, aisles: [C0.w / 2], serviceY: C0.qY + 6,
     spawn: [{ x: -22, y: C0.qY - 2 }, { x: C0.w + 22, y: C0.qY - 2 }],
-    waitSpots, tables,
+    waitSpots, tables, side,
     queueOff: [[0, 0], [6, -1], [-5, 1], [10, -2]],
-    canopy: { x0: -60, x1: C0.w + 60, yTop: 0, yFront: 30, ground: C0.h },
+    canopy: { x0: -60, x1: C0.w + 60, yTop: -90, yFront: 30, ground: C0.h },   // v2.6.5: the sheet starts above the top of the screen (overhead)
     kitchen: { stoves, chefSpots, pickup: { ...OFF }, ownerHome: { ...OFF } },
     staffSpots: { waiter: [{ ...OFF }, { ...OFF }, { ...OFF }], cashier: { ...OFF }, quankho: { ...OFF }, manager: { ...OFF } },
     props: [], deco: { den: [], cay: [], tuong: [], dacbiet: [] },
@@ -187,7 +202,7 @@ function counterLayout(scene, nSlots, nStoves) {
 // the returned arrays are sliced to those counts (order = build order).
 export function getLayout(tier, { tables = Infinity, stoves = Infinity } = {}) {
   const base = LAYOUTS[SCENE_BY_TIER[tier]];
-  return counterLayout(base.scene, Math.min(4, tables === Infinity ? 4 : tables), Math.min(base.kitchen.stoves.length, stoves));
+  return counterLayout(base.scene, Math.min(5, tables === Infinity ? 5 : tables), Math.min(base.kitchen.stoves.length, stoves));
 }
 
 /** The old top-down shop layout (kept for reference tools). */

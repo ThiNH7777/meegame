@@ -8,6 +8,7 @@ import { frame } from '../modals.js';
 import { showPopover } from '../popover.js';
 import { openLogin } from './rewards.js';
 import { openBackup, openRestore } from '../backup.js';
+import { songPicker } from '../songs.js';
 import { countUp, confettiFor, unlockIcon, unlocksAtLevel, UNLOCK_LABEL, vibrate } from './kit.js';
 
 /** self-updating switch (the shared `toggle` needs a rebuild to flip) */
@@ -116,6 +117,25 @@ async function resetEverything() {
   setTimeout(() => { try { localStorage.removeItem('xoai-lac/save/v1'); } catch (e) { /* ignore */ } try { location.reload(); } catch (e) { /* ignore */ } }, 700);
 }
 
+/** v2.6.16 Settings → "Đóng cửa sớm": end today's selling now (only while the shop is open). Guests already at the
+ *  counter are still served, nobody new comes in, then the day report shows as usual. */
+function closeEarlyCard(m) {
+  const open = S().phase === 'open';
+  const btn = h('button', { class: 'btn warn sm', disabled: !open }, 'Đóng cửa');
+  btn.addEventListener('click', () => {
+    if (S().phase !== 'open') return;
+    sfx('click');
+    ctx.confirm({
+      title: 'Đóng cửa sớm hôm nay?', icon: 'ui_home', yes: 'Đóng cửa', no: 'Bán tiếp',
+      text: 'Không nhận thêm khách mới. Khách đang ở quầy vẫn được phục vụ xong rồi mới tổng kết ngày.',
+      onYes: () => { const r = act('closeEarly'); if (r.ok === false) return; sfx('door'); m.close('closed'); },
+    });
+  });
+  return div('card set-card set-close',
+    div('set-row', ico('ui_clock', 32), div('grow', span('sl-l', 'Đóng cửa sớm'),
+      span('muted sm', open ? 'Nghỉ bán sớm hôm nay, qua tổng kết ngày luôn.' : S().phase === 'closing' ? 'Quán đang dọn hàng, sắp đóng rồi.' : 'Chỉ dùng được khi quán đang mở bán.')), btn));
+}
+
 export function openSettings() {
   return ctx.modal({
     id: 'settings', cls: 'settings', queue: false, priority: 20, sound: 'whoosh',
@@ -147,7 +167,11 @@ export function openSettings() {
           slider('Âm thanh', 'ui_sound', 'sfx', (v) => ctx.audio?.setSfx?.(v)),
           div('set-row', ico('ui_phone', 32), div('grow', span('sl-l', 'Rung khi bấm'), span('muted sm', 'Chỉ có trên điện thoại')), hap),
           div('set-row', ico('fr_xoai', 32), div('grow', span('sl-l', 'Lắc điện thoại thật'), span('muted sm', 'Lắc máy để lắc ly xoài (cần cảm biến)')), shk)),
+        div('card set-card',                                       // v2.6.21 chọn bài nhạc nền
+          div('set-row', ico('eq_speaker', 32), div('grow', span('sl-l', 'Bài nhạc nền'), span('muted sm', 'Nâng Loa nhạc để mở thêm bài'))),
+          songPicker()),
         dayLenCard(),
+        closeEarlyCard(m),
         div('card set-card',
           span('sl-l', 'Tên quán'),
           div('set-name', name, saveName)),
@@ -157,8 +181,7 @@ export function openSettings() {
             h('button', { class: 'btn jade sm', onclick: () => { sfx('click'); openBackup(); } }, 'Tạo mã sao lưu'),
             h('button', { class: 'btn paper sm', onclick: () => { sfx('click'); openRestore(); } }, 'Khôi phục'))),
         div('card set-card',
-          div('set-about', ico('ui_home', 32), div('grow', h('b', null, 'Xoài Lắc Ơi!'), span('muted sm', 'Game quản lý xe xoài lắc pixel. Cảm ơn bạn đã ghé xe nha!'),
-            span('set-credit', 'Ý tưởng game: ', h('b', null, 'Đèo Thiên Ân')))),
+          div('set-about', ico('ui_home', 32), div('grow', h('b', null, 'Xoài Lắc Ơi!'), span('muted sm', 'Game quản lý xe xoài lắc pixel. Cảm ơn bạn đã ghé xe nha!'))),
           div('set-soon', span('sl-l', 'Sắp ra mắt'), div('soon-row', C.NEXT_GAMES.map((g) => span('chip jade', ico('ui_star', 16), g))))),
         h('button', { class: 'btn red sm block', onclick: () => {
           ctx.confirm({
@@ -180,7 +203,7 @@ export function openRoadmap() {
     build: (m) => {
       const lv = D.levelInfo();
       const cur = lv.level ?? S().level;
-      const maxLv = Math.max(24, cur + 3);
+      const maxLv = Math.max(C.MASTERY.fromLv, cur + 3);
       const rows = [];
       let nextMarked = false;
       for (let L = 2; L <= maxLv; L++) {
@@ -190,7 +213,7 @@ export function openRoadmap() {
         const isNext = !past && !nextMarked; if (isNext) nextMarked = true;
         rows.push(div('rm-row' + (past ? ' past' : '') + (isNext ? ' next' : ''),
           div('rm-lv', span('num', String(L)), past ? span('mk', ico('ui_check', 16)) : null),
-          div('rm-list', un.map((u) => div('rm-u', ico(unlockIcon(u), 32), div('', h('b', null, u.name || u.id), span('muted sm', UNLOCK_LABEL[u.type] || '')))))));
+          div('rm-list', un.map((u) => div('rm-u', ico(unlockIcon(u), 32), div('', h('b', null, u.name || u.id), span('muted sm', u.desc || UNLOCK_LABEL[u.type] || '')))))));
       }
       const pct = Math.min(100, lv.pct ?? (lv.xp / Math.max(1, lv.need)) * 100);
       const [head, body] = frame('Hành trình lên cấp', { icon: 'ui_xp', onClose: () => m.close('x') });

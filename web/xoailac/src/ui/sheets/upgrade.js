@@ -5,6 +5,8 @@ import * as D from '../data.js';
 import * as C from '../../config.js';
 import { fmtShort } from '../../core/format.js';
 import { celebrate, floatAt, costBtn, pips, noteBox } from './common.js';
+import { pricesView } from './prices.js';
+import { songPicker } from '../songs.js';
 
 const CAT_ICON = { banghe: 'eq_table', bep: 'eq_stove', thietbi: 'eq_fridge', quangba: 'ui_megaphone' };
 const info = (id) => G().get?.upgradeInfo?.(id) || { level: 0, max: 0, cost: null, canBuy: false, lockedReason: null, levelName: '', nextLevelName: null };
@@ -35,6 +37,7 @@ function upCard(up, api) {
     }));
   }
   card.appendChild(bot);
+  if (up.id === 'speaker') card.appendChild(songPicker({ compact: true }));   // v2.6.21 chọn bài ngay trên thẻ Loa nhạc
   return card;
 }
 
@@ -44,8 +47,11 @@ export const upgradeSheet = {
   build(body, api) {
     const cats = C.UPGRADE_CATS;
     let sub = api.sub;
-    if (!cats.some((c) => c.id === sub)) sub = cats.find((c) => C.UPGRADES.some((u) => u.cat === c.id && info(u.id).canBuy))?.id || cats[0].id;
-    api.tabs(cats.map((c) => ({ id: c.id, label: c.name, icon: CAT_ICON[c.id], dot: C.UPGRADES.some((u) => u.cat === c.id && info(u.id).canBuy) })), sub, (id) => api.setSub(id));
+    if (sub !== 'gia' && !cats.some((c) => c.id === sub)) sub = cats.find((c) => C.UPGRADES.some((u) => u.cat === c.id && info(u.id).canBuy))?.id || cats[0].id;
+    // v2.5: prices get their own tab, after the upgrade categories
+    api.tabs(cats.map((c) => ({ id: c.id, label: c.name, icon: CAT_ICON[c.id], dot: C.UPGRADES.some((u) => u.cat === c.id && info(u.id).canBuy) }))
+      .concat([{ id: 'gia', label: 'Giá bán', icon: 'ui_tag', locked: !D.featureOn('pricing') }]), sub, (id) => api.setSub(id));
+    if (sub === 'gia') { pricesView(body, api); return; }
     const list = C.UPGRADES.filter((u) => u.cat === sub);
     if (!list.length) body.appendChild(div('nodata', 'Chưa có gì để nâng cấp ở mục này.'));
     list.forEach((u) => body.appendChild(upCard(u, api)));

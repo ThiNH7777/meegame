@@ -29,6 +29,14 @@ export function mountHud(root) {
 
   const r1 = div('hud-row r1', lvl, money, rating, clock);
 
+  // ---- v2.6.2 EXP bar: how far to the next level, in numbers
+  const xpFill = h('i');
+  const xpTxt = span('xp-t', '');
+  const xpPct = span('xp-p', '');
+  const xpBar = h('button', { class: 'xpbar', 'aria-label': 'Kinh nghiệm', onclick: () => { sfx('click'); ctx.modals?.roadmap(); } },
+    span('xp-lv', 'EXP'), div('xp-track', xpFill, xpTxt), xpPct);
+  const rx = div('hud-row rx', xpBar);
+
   // ---- row 2
   const qIco = ico('ui_quest', 32, 'qi');
   const qText = span('qtext', '');
@@ -44,7 +52,7 @@ export function mountHud(root) {
   const pauseBtn = h('button', { class: 'hbtn pause', 'aria-label': 'Tạm dừng', onclick: () => { sfx('click'); openPause(); } }, ico('ui_pause', 32));
   const r2 = div('hud-row r2', quest, pauseBtn, speed, gear);
 
-  root.append(r1, r2);
+  root.append(r1, rx, r2);
 
   // tutorial hooks
   quest.dataset.tut = 'quest';
@@ -53,7 +61,7 @@ export function mountHud(root) {
   let shown = null, hold = 0;
   const onCollected = () => { hold = performance.now() + 420; };
   ctx.game.on('collected', onCollected);
-  ctx.game.on('xp', () => { lvl.classList.remove('glow'); void lvl.offsetWidth; lvl.classList.add('glow'); });
+  ctx.game.on('xp', () => { lvl.classList.remove('glow'); void lvl.offsetWidth; lvl.classList.add('glow'); xpBar.classList.remove('gain'); void xpBar.offsetWidth; xpBar.classList.add('gain'); });
   ctx.game.on('rush', (e) => { rushTag.hidden = !e.on; });
 
   function fmtM(k) {
@@ -64,7 +72,11 @@ export function mountHud(root) {
   function onSpeed() {
     sfx('click');
     if (!featureOn('speed2')) { ctx.toast(`Tốc độ ×2 mở ở Lv ${C.FEATURES.speed2} nha.`, 'info', 'ui_lock'); return; }
-    act('setSpeed', S().speed === 2 ? 1 : 2);
+    // v2.6.10: 1× → 2× → 3× (from Lv 10) → 1×
+    const cur = S().speed;
+    const next = cur === 1 ? 2 : cur === 2 && featureOn('speed3') ? 3 : 1;
+    if (cur === 2 && !featureOn('speed3') && C.FEATURES.speed3) ctx.toast(`Tốc độ ×3 mở ở Lv ${C.FEATURES.speed3} nha.`, 'info', 'ui_lock');
+    act('setSpeed', next);
   }
   async function onQuest() {
     sfx('click');
@@ -112,6 +124,10 @@ export function mountHud(root) {
     const lv = levelInfo();
     setText(lvNum, lv.level);
     setStyleVar(ringFill, '--p', Math.round(lv.pct));
+    setStyleVar(xpFill, '--p', lv.pct.toFixed(1));
+    const nf = (v) => Math.floor(v).toLocaleString('vi-VN');
+    setText(xpTxt, `${nf(lv.xp)} / ${nf(lv.need)}`);
+    setText(xpPct, `${Math.floor(lv.pct)}% → Lv ${lv.level + 1}`);
     setText(ratingNum, fmtRating(s.rating?.avg ?? 3.5));
     setText(wd, weekday(s.day));
     setText(clockT, fmtClock(s.clock));
@@ -119,10 +135,11 @@ export function mountHud(root) {
     try { wxN = ctx.game.get?.weatherNow?.() || s.weather; } catch (e) { /* day weather */ }
     setIco(wxImg, wxIcon(wxN), 16);
     // speed
-    const sp = s.speed === 2;
+    const sp = s.speed === 2 || s.speed === 3;
     setClass(speed, 'on', sp);
+    setClass(speed, 'x3', s.speed === 3);
     setClass(speed, 'dim', !featureOn('speed2'));
-    setText(speedLbl, featureOn('speed2') ? (sp ? '2×' : '1×') : '1×');
+    setText(speedLbl, featureOn('speed2') ? (s.speed === 3 ? '3×' : sp ? '2×' : '1×') : '1×');
     // quest
     const mq = mainQuest();
     const claim = !!(s.quests?.mainClaimable || mq.done) && !!mq.quest;
@@ -145,6 +162,22 @@ export function mountHud(root) {
   return { update, moneyAnchor, els: { quest, lvl, money, speed, gear, rating } };
 }
 
+/** v2.6.17: "Đóng cửa sớm" in the pause box too (only while the shop is open); asks once more before closing. */
+function closeEarlyBtn(m) {
+  const open = S().phase === 'open';
+  const b = h('button', { class: 'btn warn block pz-close', disabled: !open }, ico('ui_home', 16), open ? 'Đóng cửa sớm' : S().phase === 'closing' ? 'Quán đang dọn hàng' : 'Đóng cửa sớm (khi đang bán)');
+  b.addEventListener('click', () => {
+    if (S().phase !== 'open') return;
+    sfx('click');
+    ctx.confirm({
+      title: 'Đóng cửa sớm hôm nay?', icon: 'ui_home', yes: 'Đóng cửa', no: 'Bán tiếp',
+      text: 'Không nhận thêm khách mới. Khách đang ở quầy vẫn được phục vụ xong rồi mới tổng kết ngày.',
+      onYes: () => { const r = act('closeEarly'); if (r && r.ok === false) return; sfx('door'); m.close('closed'); },
+    });
+  });
+  return b;
+}
+
 /** pause: a pausing modal (ctx.modal pauses the sim while it is open) */
 function openPause() {
   return ctx.modal({
@@ -152,6 +185,7 @@ function openPause() {
     build: (m) => frame('Tạm dừng', { icon: 'ui_pause', onClose: () => m.close('x') },
       div('pause-box',
         span('pz-txt', 'Quán đang tạm nghỉ — khách đứng yên, đồng hồ không chạy. Bấm chơi tiếp khi sẵn sàng nha!'),
-        h('button', { class: 'btn jade block', onclick: () => { sfx('click'); m.close('resume'); } }, ico('ui_play', 16), 'Chơi tiếp'))),
+        h('button', { class: 'btn jade block', onclick: () => { sfx('click'); m.close('resume'); } }, ico('ui_play', 16), 'Chơi tiếp'),
+        closeEarlyBtn(m))),
   });
 }

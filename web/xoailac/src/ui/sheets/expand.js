@@ -89,7 +89,7 @@ export function expandView(body, api) {
 // ------------------------------------------------------------------ Chi nhánh
 // Stylised Vietnam outline in a 200×300 box + pin positions (same box, %).
 const VN_PATH = 'M40 10 L80 5 L105 18 L130 12 L142 30 L120 55 L110 75 L113 95 L126 115 L129 140 L139 165 L151 185 L153 205 L161 225 L166 245 L151 262 L136 275 L119 286 L97 292 L76 298 L60 292 L65 275 L82 262 L95 248 L105 225 L100 205 L90 190 L96 165 L84 140 L75 120 L62 100 L50 85 L38 70 L28 50 L30 30 Z';
-const PINS = { hanoi: [96, 50], danang: [143, 172], dalat: [104, 210], vungtau: [144, 282], cantho: [72, 279] };
+const PINS = { hanoi: [96, 50], danang: [143, 172], dalat: [104, 210], vungtau: [144, 282], cantho: [72, 279], phuquoc: [30, 262] };
 
 function vnMap(onPick) {
   const s = S();
@@ -101,12 +101,12 @@ function vnMap(onPick) {
   C.BRANCHES.forEach((b) => {
     const lvl = s.branches?.[b.id] || 0;
     const [x, y] = PINS[b.id] || [100, 150];
-    const pin = h('button', { class: 'pin' + (lvl ? ' open' : ''), style: { left: (x / 2) + '%', top: (y / 3) + '%' }, 'aria-label': b.name },
+    const pin = h('button', { class: 'pin' + (lvl ? ' open' : '') + (s.homeCity === b.id ? ' home' : ''), style: { left: (x / 2) + '%', top: (y / 3) + '%' }, 'aria-label': b.name },
       span('pin-dot', lvl ? span('num', String(lvl)) : ico('ui_lock', 16)), span('pin-name', b.name));
     pin.addEventListener('click', () => { sfx('click'); onPick(b.id); });
     map.appendChild(pin);
   });
-  const hq = h('div', { class: 'pin hq', style: { left: '76%', top: '80%' } }, span('pin-dot', ico('ui_shop', 16)), span('pin-name', 'TP.HCM'));
+  const hq = h('div', { class: 'pin hq' + (s.homeCity ? ' was' : ''), style: { left: '76%', top: '80%' } }, span('pin-dot', ico('ui_shop', 16)), span('pin-name', 'TP.HCM'));
   map.appendChild(hq);
   return map;
 }
@@ -115,14 +115,27 @@ export function branchesView(body, api) {
   const s = S();
   if (D.tierNow() < 5) { body.appendChild(lockCard('Chi nhánh', 'Mở rộng thành Chuỗi Xoài Lắc Nhà Mình rồi mới mở chi nhánh khắp Việt Nam được nha.', 'ui_map')); return; }
   const lvls = C.BRANCHES.map((b) => s.branches?.[b.id] || 0);
-  const open = lvls.filter((v) => v > 0).length;
+  const open = C.BRANCHES.filter((b, i) => !b.bonus && lvls[i] > 0).length;
+  const mainN = C.BRANCHES.filter((b) => !b.bonus).length;
+  const bMax = G().get?.branchMax?.() ?? C.BRANCH.maxLevel;
   const bs = C.branchScale(s);
   const rate = C.BRANCHES.reduce((a, b, i) => a + b.income * bs * lvls[i], 0);
 
   const cards = {};
   body.appendChild(vnMap((id) => { const el = cards[id]; if (!el) return; el.scrollIntoView({ block: 'center', behavior: ctx.reduced ? 'auto' : 'smooth' }); el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash'); }));
-  body.appendChild(div('card bsum', div('grow', h('b', null, `${open}/${C.BRANCHES.length} chi nhánh`), span('muted sm', 'Mở đủ 5 nơi là hoàn thành hành trình nha!')),
+  body.appendChild(div('card bsum', div('grow', h('b', null, `${open}/${mainN} chi nhánh`), span('muted sm', `Mở đủ ${mainN} nơi là hoàn thành hành trình nha!`)),
     span('chip gold', ico('ui_coin', 16), span('num', '+' + vnNum(rate) + 'k/giây'))));
+  // v2.6.7 dời quán chính: pick any city with an open branch; only the view changes
+  const home = C.BRANCHES.find((b) => b.id === s.homeCity);
+  const homeCard = div('card bsum home-city', ico('ui_shop', 32),
+    div('grow', h('b', null, 'Quán chính: ' + (home ? home.name : 'TP.HCM')),
+      span('muted sm', home ? 'Đổi cảnh quầy sang thành phố này. Tiền, khách và cấp quán vẫn như cũ.' : 'Mở chi nhánh ở thành phố nào thì dời quán chính tới đó được, để đổi cảnh quầy.')));
+  if (home) {
+    const back = h('button', { class: 'btn paper sm' }, 'Về TP.HCM');
+    back.addEventListener('click', () => { sfx('click'); const r = act('setHomeCity', null); if (r && r.ok === false) return; api.rerender(); });
+    homeCard.appendChild(back);
+  }
+  body.appendChild(homeCard);
   body.appendChild(secTitle('Các chi nhánh', 'tiền về cả khi bạn đi vắng'));
 
   C.BRANCHES.forEach((b, i) => {
@@ -132,13 +145,16 @@ export function branchesView(body, api) {
     card.appendChild(div('br-top', div('br-pin', span('num', lvl ? String(lvl) : '?')), div('grow', h('b', null, b.name), span('muted sm', b.dish)),
       lvl ? span('chip gold', ico('ui_coin', 16), span('num', '+' + vnNum(b.income * bs * lvl) + 'k/s')) : span('chip', 'Chưa mở')));
     const bot = div('br-bot');
-    if (!lvl) {
+    if (!lvl && b.minLevel && s.level < b.minLevel) {
+      bot.appendChild(span('muted sm', `Mở ở Lv ${b.minLevel} · thu nhập ${vnNum(b.income * bs)}k mỗi giây`));
+      bot.appendChild(span('chip', ico('ui_lock', 16), 'Lv ' + b.minLevel));
+    } else if (!lvl) {
       bot.appendChild(span('muted sm', `Thu nhập ${vnNum(b.income * bs)}k mỗi giây`));
       bot.appendChild(costBtn(b.cost, { can: s.money >= b.cost, label: 'Khai trương', cls: 'red',
         onClick: (btn) => { const r = act('openBranch', b.id); if (r.ok === false) return; celebrate(btn); ctx.fx?.confetti?.(document.getElementById('fx-root'), { count: 40, duration: 1.4 }); api.rerender(); } }));
     } else {
-      bot.appendChild(pips(lvl, C.BRANCH.maxLevel));
-      if (lvl >= C.BRANCH.maxLevel) bot.appendChild(span('chip jade', ico('ui_check', 16), 'Tối đa'));
+      bot.appendChild(pips(lvl, bMax));
+      if (lvl >= bMax) bot.appendChild(span('chip jade', ico('ui_check', 16), 'Tối đa'));
       else {
         const cost = C.BRANCH.upgradeCost(b, lvl);
         bot.appendChild(costBtn(cost, { can: s.money >= cost, label: 'Nâng cấp',
@@ -146,6 +162,17 @@ export function branchesView(body, api) {
       }
     }
     card.appendChild(bot);
+    if (lvl) {                                        // v2.6.7: move the main shop here (scene only)
+      const mv = div('br-bot br-home');
+      if (s.homeCity === b.id) mv.appendChild(span('chip jade', ico('ui_check', 16), 'Quán chính đang ở đây'));
+      else {
+        mv.appendChild(span('muted sm', 'Đổi cảnh quầy sang ' + b.name));
+        const go = h('button', { class: 'btn jade sm' }, ico('ui_shop', 16), 'Dời quán chính tới đây');
+        go.addEventListener('click', () => { sfx('click'); const r = act('setHomeCity', b.id); if (r && r.ok === false) return; celebrate(go); api.rerender(); });
+        mv.appendChild(go);
+      }
+      card.appendChild(mv);
+    }
     body.appendChild(card);
   });
 }

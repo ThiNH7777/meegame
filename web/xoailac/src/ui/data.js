@@ -42,6 +42,16 @@ export function potPrice(id) {
   const p = POT[id]; const lvl = st().recipes?.[id]?.lvl ?? 1;
   return Math.round(p.price * (1 + (lvl - 1) * C.RECIPE.pricePerLevel));
 }
+/** What a dish sells for now (player price or reference). */
+export function sellPrice(id) { const v = get('priceInfo', id); return v ? v.price : potPrice(id); }
+/** v2.5 món ăn kèm: why a side is still locked ("Mở ở Lv 9" / "Xong nhiệm vụ: …"). */
+export function lockText(id) {
+  const d = ING[id]; if (!d) return '';
+  if (st().level < d.unlockLv) return 'Mở ở Lv ' + d.unlockLv;
+  if (d.quest) { const q = C.MAIN_QUESTS.find((x) => x.id === d.quest); return 'Xong nhiệm vụ: ' + (q ? q.text : d.quest); }
+  return '';
+}
+export const SIDES = C.INGREDIENTS.filter((i) => i.side);
 export const ingUnlocked = (id) => { const v = get('isIngUnlocked', id); return v ?? st().level >= ING[id].unlockLv; };
 export const potUnlocked = (id) => { const v = get('isPotUnlocked', id); return v ?? st().level >= POT[id].unlockLv; };
 export const drinkUnlocked = (id) => { const v = get('isDrinkUnlocked', id); return v ?? st().level >= DRINK[id].unlockLv; };
@@ -73,7 +83,7 @@ export function dailyList() {
   return list.map((t) => {
     const def = C.DAILY_POOL.find((d) => d.id === t.id) || {};
     const target = t.target ?? 1;
-    const nTxt = def.type === 'dayRevenue' ? fmtShort(target) : target;
+    const nTxt = ['dayRevenue', 'dayProfit', 'tips'].includes(def.type) ? fmtShort(target) : target;
     const text = (def.text || t.text || t.id || '').replace('{n}', nTxt);
     const progress = t.progress || 0;
     return { ...t, text, type: def.type, chest: t.chest || def.chest || 'wood', progress, target, claimed: !!t.claimed, done: t.done ?? progress >= target, failed: !!t.failed };

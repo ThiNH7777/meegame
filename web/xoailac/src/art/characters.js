@@ -64,14 +64,17 @@ export function makeLook(kind, seed = 1, memberIdx = 0) {
   kind = KIND_SHEETS[kind] ? kind : 'pedestrian';
   seed = (seed | 0) || 1; memberIdx = memberIdx | 0;
   const list = KIND_SHEETS[kind];
-  const h = hash(seed * 31 + 7 + (kind === 'hoiban' || kind === 'giadinh' ? 0 : memberIdx * 13));
+  // v2.6.4: one hash per GROUP (seed), members walk through the kind's sheets in turn, so a pair is always
+  // one of each (nam + nữ, hội bạn a + b) instead of two random picks that often matched
+  const h = hash(seed * 31 + 7);
   let pick;
   if (kind === 'giadinh') pick = Math.min(Math.max(memberIdx, 0), 2);
   else if (kind === 'capdoi') pick = memberIdx & 1;
   else if (kind === 'doandulich') pick = memberIdx === 0 ? 0 : 1;
-  else if (kind === 'hoiban') pick = (h + memberIdx) & 1;
-  else pick = h % list.length;
+  else pick = (h + memberIdx) % list.length;
   const look = { kind, sheet: firstExisting(list, pick), seed, memberIdx };
+  // clothes colour: one of CUST_VARIANTS per person (0 = as painted), different for each member of a group
+  if (!KEEP_COLOURS.has(look.sheet)) look.variant = (hash(seed * 13 + 5) + (kind === 'hoiban' ? 0 : memberIdx)) % CUST_VARIANTS.length;   // hội bạn: same club tee colour
   if (kind === 'giadinh' && memberIdx >= 2) look.kid = true;
   return look;
 }
@@ -102,6 +105,114 @@ function sheetOf(look) {
   else s = makeStaffLook('phucvu', seed).sheet;          // kind-less record such as {lookSeed}: treat as a waiter
   sheetCache.set(look, s);
   return s;
+}
+
+// ───────────────────────── đồng phục (v2.3, Lv 21) ─────────────────────────
+// Staff sheets are recoloured once per choice into a copy of the atlas: saturated red/orange cloth below the head
+// (apron, vest, neckerchief, bow; the stock-keeper's green cap too) → the chosen colour, and for some styles the
+// white shirt → a pale tint or charcoal. Skin, hair and faces stay untouched (head rows and low-chroma tones skip).
+import * as CFG from '../config.js';
+let uniKey = '', uniRec = null;
+function rgb2hsl(r, g, b) {
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2;
+  if (mx === mn) return [0, 0, l];
+  const d = mx - mn, s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+  let h = mx === r ? (g - b) / d + (g < b ? 6 : 0) : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  return [h / 6, s, l];
+}
+function hsl2rgb(h, s, l) {
+  if (!s) return [l, l, l];
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s, p = 2 * l - q;
+  const f = (t) => { t = (t + 1) % 1; return t < 1 / 6 ? p + (q - p) * 6 * t : t < 0.5 ? q : t < 2 / 3 ? p + (q - p) * (2 / 3 - t) * 6 : p; };
+  return [f(h + 1 / 3), f(h), f(h - 1 / 3)];
+}
+const hexRgb = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16) / 255);
+const cl = (v, a, b) => Math.max(a, Math.min(b, v));
+function buildUniform(color, style) {
+  const c = document.createElement('canvas');
+  c.width = rec.img.width; c.height = rec.img.height;
+  const g = c.getContext('2d');
+  g.drawImage(rec.img, 0, 0);
+  const tgt = color ? rgb2hsl(...hexRgb(color)) : null;
+  const shirtH = rgb2hsl(...hexRgb(color || '#d9473a'));
+  for (const key of Object.keys(FR)) {
+    if (key.indexOf('staff_') !== 0) continue;
+    const [fx, fy, fw, fh] = FR[key];
+    const id = g.getImageData(fx, fy, fw, fh), p = id.data;
+    let t0 = -1, b1 = -1;
+    for (let j = 0; j < fh; j++) for (let i = 0; i < fw; i++) if (p[(j * fw + i) * 4 + 3]) { if (t0 < 0) t0 = j; b1 = j; }
+    if (t0 < 0) continue;
+    const cut = t0 + 25, foot = b1 - 4, cap = key.indexOf('staff_quankho') === 0;
+    for (let j = 0; j < foot; j++) for (let i = 0; i < fw; i++) {
+      const o = (j * fw + i) * 4;
+      if (!p[o + 3]) continue;
+      const r = p[o] / 255, gg = p[o + 1] / 255, b = p[o + 2] / 255;
+      const [H, S, L] = rgb2hsl(r, gg, b), hd = H * 360, ch = Math.max(r, gg, b) - Math.min(r, gg, b);
+      let accent = j > cut && S > 0.45 && L >= 0.12 && L <= 0.62 && (hd <= 45 || hd >= 335) && ch > 0.25;
+      if (cap && hd >= 60 && hd <= 110 && S > 0.2 && ch > 0.12) accent = true;
+      const shirt = !accent && j > cut && ch < 0.12 && Math.max(r, gg, b) > 0.55;
+      let out = null;
+      if (accent && tgt) out = hsl2rgb(tgt[0], tgt[1], cl(tgt[2] + (L - 0.5), 0.05, 0.95));
+      else if (shirt && style === 'aothun') out = hsl2rgb(shirtH[0], shirtH[1] * 0.6, cl(0.84 + (L - 0.93), 0.3, 0.97));
+      else if (shirt && style === 'aotoi') out = hsl2rgb(0.72, 0.1, cl(0.26 + (L - 0.93) * 0.8, 0.08, 0.6));
+      if (out) { p[o] = out[0] * 255; p[o + 1] = out[1] * 255; p[o + 2] = out[2] * 255; }
+    }
+    g.putImageData(id, fx, fy);
+  }
+  return { img: c, flipped: null, file: 'chars:uniform' };
+}
+/** Pick the staff uniform (state.uniform, or null = original sprites). Cheap to call every frame. */
+export function setUniform(u) {
+  const col = u && (CFG.UNIFORM.colors.find((x) => x.id === u.color) || {}).hex || null;
+  const style = u && u.style !== 'tapde' ? u.style : 'tapde';
+  const key = col || style !== 'tapde' ? (col || '-') + '/' + style : '';
+  if (key === uniKey && (uniRec || !key)) return;
+  if (key && (!rec.img || typeof document === 'undefined')) return;          // atlas not ready: retry next call
+  uniKey = key;
+  try { uniRec = key ? buildUniform(col, style) : null; } catch (e) { uniRec = null; }
+}
+const recFor = (sheet) => (uniRec && sheet.indexOf('staff_') === 0 ? uniRec : rec);
+
+// ───────────────────────── customer clothes colours (v2.6.4) ─────────────────────────
+// Each customer sheet exists in 4 colourings: the clothes below the neck are hue-shifted; skin, hair (dark browns
+// and auburns), whites, greys and blacks stay as painted. Characters with a signature look keep their colours.
+const CUST_VARIANTS = [0, 0.33, 0.58, 0.82];
+const KEEP_COLOURS = new Set(['cust_khachtay_f', 'cust_tiktoker', 'cust_reviewer', 'cust_chutu', 'cust_veso', 'cust_shipper', 'cust_doandulich_leader']);
+const custRecs = [];
+function buildCustVariant(shift) {
+  const c = document.createElement('canvas');
+  c.width = rec.img.width; c.height = rec.img.height;
+  const g = c.getContext('2d', { willReadFrequently: true });
+  g.drawImage(rec.img, 0, 0);
+  for (const key of Object.keys(FR)) {
+    const sheet = key.slice(0, key.indexOf('/'));
+    if (sheet.indexOf('cust_') !== 0 || KEEP_COLOURS.has(sheet)) continue;
+    const [fx, fy, fw, fh] = FR[key];
+    const id = g.getImageData(fx, fy, fw, fh), p = id.data;
+    let t0 = -1, b1 = -1;
+    for (let j = 0; j < fh; j++) for (let i = 0; i < fw; i++) if (p[(j * fw + i) * 4 + 3]) { if (t0 < 0) t0 = j; b1 = j; }
+    if (t0 < 0) continue;
+    const cut = t0 + Math.round(0.5 * (b1 - t0));          // the neck, for adults and kids alike
+    for (let j = cut; j <= b1; j++) for (let i = 0; i < fw; i++) {
+      const o = (j * fw + i) * 4;
+      if (!p[o + 3]) continue;
+      const r = p[o] / 255, gg = p[o + 1] / 255, b = p[o + 2] / 255;
+      const [H, S, L] = rgb2hsl(r, gg, b), hd = H * 360, ch = Math.max(r, gg, b) - Math.min(r, gg, b);
+      const skin = hd >= 8 && hd <= 42 && L > 0.5 && S > 0.3 && ch < 0.45;
+      const hair = hd >= 5 && hd <= 45 && L < 0.45;
+      if (S < 0.28 || ch < 0.16 || L < 0.14 || L > 0.9 || skin || hair) continue;
+      const out = hsl2rgb((H + shift) % 1, S, L);
+      p[o] = out[0] * 255; p[o + 1] = out[1] * 255; p[o + 2] = out[2] * 255;
+    }
+    g.putImageData(id, fx, fy);
+  }
+  return { img: c, flipped: null, file: 'chars:cust' + shift };
+}
+function recForLook(sheet, look) {
+  const v = look && look.variant | 0;
+  if (!v || sheet.indexOf('cust_') !== 0 || KEEP_COLOURS.has(sheet)) return recFor(sheet);
+  if (!custRecs[v] && rec.img && typeof document !== 'undefined') { try { custRecs[v] = buildCustVariant(CUST_VARIANTS[v]); } catch (e) { custRecs[v] = rec; } }
+  return custRecs[v] || rec;
 }
 
 // ───────────────────────── drawing ─────────────────────────
@@ -215,7 +326,7 @@ function draw(ctx, look, x, y, o) {
     const c = tinted(f, flip, sheet + '/' + (spr[name] ? name : 'idle_d'));
     if (c) { drawTinted(ctx, c, f, bx, by, flip); drawn = true; }
   }
-  if (!drawn) blit(ctx, rec, f, bx, by, flip, 1);
+  if (!drawn) blit(ctx, recForLook(sheet, look), f, bx, by, flip, 1);
   if (it && facing !== 'up') blit(ctx, rec, it, ix, iy, false, 1);
   if (alpha !== 1) ctx.globalAlpha = 1;
 }
@@ -229,7 +340,7 @@ export function portraitURL(look, scale = 4) {
   try {
     if (!rec.img || typeof document === 'undefined') return BLANK;      // not cached: art not loaded yet
     const sheet = sheetOf(look);
-    const key = sheet + '@' + scale;
+    const key = sheet + '@' + scale + (sheet.indexOf('staff_') === 0 ? '#' + uniKey : '');
     let url = urlCache.get(key);
     if (url) return url;
     const f = (SPR[sheet] || {}).idle_d;
@@ -239,7 +350,7 @@ export function portraitURL(look, scale = 4) {
     const bg = base.getContext('2d');
     bg.imageSmoothingEnabled = false;
     // centre the head on the crop; take the top 32 rows (hair/hat, face, shoulders)
-    bg.drawImage(rec.img, f[0], f[1], f[2], f[3], 16 - f[4], 1, f[2], f[3]);
+    bg.drawImage(recFor(sheet).img, f[0], f[1], f[2], f[3], 16 - f[4], 1, f[2], f[3]);
     const size = Math.max(16, Math.round(16 * scale));
     const c = document.createElement('canvas');
     c.width = c.height = size;

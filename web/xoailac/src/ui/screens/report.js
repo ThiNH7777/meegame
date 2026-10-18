@@ -1,15 +1,15 @@
 // Day report (TECH_SPEC §9.4): animated tally → stars → best review → level progress → tomorrow's forecast → "Ngày mới".
 import * as C from '../../config.js';
-import { h, div, span, ico } from '../dom.js';
+import { h, div, span, ico, rich } from '../dom.js';
 import { ctx, act, S, sfx } from '../ctx.js';
 import * as D from '../data.js';
-import { fmtMoney, fmtRating, weekday } from '../../core/format.js';
+import { fmtMoney, fmtRating, weekday, fmtShort } from '../../core/format.js';
 import { frame } from '../modals.js';
 import { stars, portrait, noteBox } from '../sheets/common.js';
 import { countUp, createTimeline, wxName } from './kit.js';
 
-const COST_LABEL = { ingredients: 'Nguyên liệu', broth: 'Trái cây', drinks: 'Nước uống', salary: 'Lương nhân viên', rent: 'Thuê mặt bằng', marketing: 'Quảng bá', lottery: 'Mua vé số' };
-const COST_ICON = { ingredients: 'ui_kho', broth: 'ui_fire', drinks: 'drk_trada', salary: 'ui_staff', rent: 'ui_home', marketing: 'ui_megaphone', lottery: 'ui_ticket' };
+const COST_LABEL = { ingredients: 'Nguyên liệu', broth: 'Trái cây', supplies: 'Ly, hộp & vật tư', drinks: 'Nước uống', salary: 'Lương nhân viên', rent: 'Thuê mặt bằng', marketing: 'Quảng bá', lottery: 'Mua vé số', liquidation: 'Lỗ thanh lý hàng cũ' };
+const COST_ICON = { ingredients: 'ui_kho', broth: 'ui_fire', supplies: 'sup_lylac', drinks: 'drk_trada', salary: 'ui_staff', rent: 'ui_home', marketing: 'ui_megaphone', lottery: 'ui_ticket', liquidation: 'ui_tag' };
 const MINUS = '−';
 
 const money = (v) => fmtMoney(Math.round(v * 1000) / 1000);
@@ -76,7 +76,19 @@ function build(m, rep) {
   if (rep.comboMax >= 2) chips.push(span('chip jade', ico('ui_fire', 16), `Combo ×${rep.comboMax}`));
   if (rep.potsSold > 0) chips.push(span('chip', ico('ui_menu', 16), `${rep.potsSold} phần xoài lắc`));
   if (rep.drinksSold > 0) chips.push(span('chip', ico('drk_trada', 16), `${rep.drinksSold} nước`));
+  if (rep.sidesSold > 0) chips.push(span('chip', ico('ak_cavien', 16), `${rep.sidesSold} món ăn kèm`));
+  if (rep.delivered > 0 || rep.deliveryMissed > 0) chips.push(span('chip', ico('eq_moto', 16), `${rep.delivered} đơn giao` + (rep.deliveryMissed ? ` · lỡ ${rep.deliveryMissed} (hết hàng)` : '')));   // v2.6.9
+  if (rep.seated > 0) chips.push(span('chip jade', ico('eq_table', 16), `${rep.seated} nhóm ngồi bàn`));
+  if (rep.priceLost > 0) chips.push(span('chip red', ico('emo_money', 16), `Chê đắt ${rep.priceLost}`));
   sec(div('rp-chips', chips));
+  // v2: wage debt + supplies that ran out
+  const miss = Object.keys(rep.supplyMiss || {}).filter((k) => rep.supplyMiss[k] > 0);
+  const notes = [];
+  if (rep.salaryOwed > 0) notes.push(`Két không đủ trả lương: còn nợ **${fmtShort(rep.salaryOwed)}** (đã tính vào chi phí). Trả nợ ở mục Nhân viên nha.`);
+  else if (rep.wageDebtTotal > 0) notes.push(`Quán còn nợ lương **${fmtShort(rep.wageDebtTotal)}**.`);
+  (rep.staffNotes || []).forEach((n) => notes.push(n.type === 'quit' ? `**${n.name}** đã nghỉ việc.` : n.type === 'warn' ? `**${n.name}** báo sẽ nghỉ nếu không khá hơn.` : `**${n.name}** vui vẻ ở lại.`));
+  if (miss.length) notes.push('Thiếu vật tư: ' + miss.map((k) => `${(C.SUPPLIES.find((x) => x.id === k) || { name: k }).name.toLowerCase()} ×${rep.supplyMiss[k]}`).join(', ') + '.');
+  if (notes.length) sec(div('card note ' + (rep.salaryOwed > 0 || miss.length ? 'red' : ''), ico('ui_info', 32), h('p', null, rich(notes.join(' ')))));
 
   // best review
   const br = rep.bestReview;

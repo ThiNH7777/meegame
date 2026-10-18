@@ -279,7 +279,7 @@ export function createTutorial({ coachRoot }) {
     const on = (e, f) => g.on?.(e, (p) => { try { f(p || {}); } catch (err) { console.error('[tutorial] ' + e, err); } });
     on('ticketReady', () => { mem.served = true; });
     on('collected', () => { if (!tut().done && tut().step >= LAST) mem.collected = true; });
-    on('stockLow', () => { if (tut().done) queueTip('stock', 'Nguyên liệu sắp hết rồi! Mở **Kho** nhập thêm ngay cả khi đang bán nha.', 'kho'); });
+    on('stockLow', () => { if (tut().done) queueTip('stock', 'Nguyên liệu sắp hết rồi! Đang bán thì mở **Kho** đặt qua app, shipper giao tới sau ít phút nha.', 'kho'); });
     on('levelUp', (p) => { if (p.level === 2) queueTip('staff', 'Giờ bạn thuê được **Phục vụ** rồi! Vào **Nhân viên** xem thử nha.', 'staff'); });
     on('customerLeft', (p) => { if (p.angry && tut().done) queueTip('angry', 'Khách bỏ về vì chờ lâu! Thuê người phụ hay nâng cấp dao thớt sẽ đỡ hơn nha.', 'upgrade'); });
     on('phase', (p) => {

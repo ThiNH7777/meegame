@@ -18,9 +18,10 @@ import {
 } from './util.js';
 import { makeGain, makeDeferred } from './kit.js';
 import { createSfx, SFX_NAMES } from './sfx.js';
-import { createBgm } from './bgm.js';
+import { createBgm } from './bgm.js?v=a21';   // v2.6.21: versioned so an old cached copy can't drop the new songs
 import { createAmbience, boilingCount, boilLevel, rainLevel } from './ambience.js';
 import { wireEvents } from './events.js';
+import { SONGS } from '../config.js';
 
 export { boilingCount, boilLevel, rainLevel, SFX_NAMES };
 
@@ -31,9 +32,28 @@ const MUSIC_TRIM = 1.4;         // overall BGM level at slider = 1 (tuned with t
 const MASTER = 0.9;
 const VARIANT_HOLD = 4;         // min seconds between BGM variant switches (no flip-flopping)
 
+// v2.6.20: each Loa nhạc level adds songs; while the shop is open the radio rotates through what's unlocked
+// every SONG_MIN game minutes (day and night have their own playlists).
+// v2.6.21: settings.song picks one song (any unlocked one); it plays from the morning until the day report.
+export const SONG_NAMES = Object.fromEntries(SONGS.map((x) => [x.id, x.name]));
+const SONG_MIN = 75;
+const speakerLv = (state) => Math.max(0, (state && state.upgrades && state.upgrades.speaker) | 0);
+export function songUnlocked(state, id) { const sg = SONGS.find((x) => x.id === id); return !!sg && speakerLv(state) >= sg.lv; }
+export function playlistOf(state, night) {
+  const lv = speakerLv(state);
+  return SONGS.filter((x) => x.lv <= lv && (x.time === 'both' || x.time === (night ? 'night' : 'day'))).map((x) => x.id);
+}
 export function pickVariant(state) {
   const ph = state && state.phase;
-  if (ph === 'open' || ph === 'closing') return state.clock >= NIGHT_FROM ? 'night' : 'day';
+  const pick = state && state.settings && state.settings.song;
+  if (pick && pick !== 'auto' && ph !== 'report' && songUnlocked(state, pick)) return pick;
+  if (ph === 'open' || ph === 'closing') {
+    const night = state.clock >= NIGHT_FROM;
+    const list = playlistOf(state, night);
+    if (list.length === 1) return list[0];
+    const slot = Math.floor(Math.max(0, state.clock - (night ? NIGHT_FROM : 0)) / SONG_MIN) + ((state.day | 0) * 3);
+    return list[slot % list.length];
+  }
   return 'calm';
 }
 
@@ -107,6 +127,7 @@ export function _createEngine(ctx, game, opts) {
   let seenSfx = null;
   let hidden = false;
   let variantHold = 0;
+  let seenSong = null;
   let slow = 1;
   let lastCount = 0;
   const ambOpts = { rain: false, storm: false, bike: false };
@@ -158,8 +179,10 @@ export function _createEngine(ctx, game, opts) {
       }
     }
 
-    // BGM variant
+    // BGM variant (a song picked in Settings switches right away)
     variantHold -= dt;
+    const songSet = set && set.song;
+    if (songSet !== seenSong) { seenSong = songSet; variantHold = 0; }
     const want = pickVariant(state);
     const have = bgm.current();
     if (want !== have && (have === null || variantHold <= 0)) {

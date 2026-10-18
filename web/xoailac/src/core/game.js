@@ -5,7 +5,8 @@ import { createRng } from './rng.js';
 import { migrate } from './state.js';
 import { createWorld, syncLayout } from './world.js';
 import {
-  UP, DECO_BY_ID, POT, tierDef, mods, addMoney, addXp, setLevel, isPotUnlocked, featureUnlocked, buyIngredient, builtTables, builtStoves, syncLots,
+  UP, DECO_BY_ID, POT, tierDef, mods, addMoney, addXp, settleXp, setLevel, isPotUnlocked, featureUnlocked, buyIngredient, builtTables, builtStoves, syncLots,
+  priceBounds, buySupply, placeOrder, deliverOrders, quankhoRun, liquidate, liquidateQuote, oldStock, SUPPLIER, supplierUnlocked, recipeMaxLevel,
 } from './economy.js';
 import * as kitchen from './kitchen.js';
 import * as customers from './customers.js';
@@ -16,6 +17,7 @@ import * as day from './day.js';
 import * as rain from './rain.js';
 import { createGetters } from './getters.js';
 import { fmtMoney, fmtDuration } from './format.js';
+import { sanitizeBrand, sanitizeUniform, sanitizeFacade, facadeItem } from './looks.js';
 
 const STEP = 0.1;            // max real seconds per simulation sub-step
 const fail = (reason, msg) => ({ ok: false, reason, msg });
@@ -70,7 +72,27 @@ export function createGame(save, opts = {}) {
   syncLayout(G, true);
   workers.syncWorkers(G, true);
   syncLots(G);
-  if (state.started) staff.genCandidates(G);
+  if (state.started) {
+    const up = settleXp(G);                 // v2.6.1 easier XP curve: XP already earned may be worth a level now
+    if (up > 0) pending.push(['mom', { key: 'xpEase', text: `Bản mới lên cấp dễ hơn nè con! Kinh nghiệm con tích được đủ lên thẳng Lv ${state.level} rồi đó.` }]);
+    staff.genCandidates(G);
+  }
+  if (state.flags.ui.decoRefund) {
+    pending.push(['mom', { key: 'decoRefund', text: `Mấy món tranh treo tường với đồ Đặc biệt đặt trong quán khách ngoài đường đâu có thấy, Má bán lại được ${fmtMoney(state.flags.ui.decoRefund)} bỏ vô két rồi. Giờ con trang trí mặt tiền (cờ, chậu hoa, bảng hiệu) cho khách nhìn thấy nha!` }]);
+    delete state.flags.ui.decoRefund;
+  }
+  if (state.flags.ui.supplierRefund) {
+    pending.push(['mom', { key: 'supplierRefund', text: `Mối vựa trái cây nghỉ giao rồi con, Má lấy lại ${fmtMoney(state.flags.ui.supplierRefund)} tiền cọc bỏ vô két. Muốn tự nhập hàng mỗi sáng thì thuê Quản kho nha.` }]);
+    delete state.flags.ui.supplierRefund;
+  }
+  if (state.flags.ui.sideRefund) {
+    pending.push(['mom', { key: 'sideRefund', text: `Vỉa hè chỉ kê vừa 4 bộ bàn thôi con, mấy bộ dư Má bán lại được ${fmtMoney(state.flags.ui.sideRefund)} rồi bỏ vô két cho con đó.` }]);
+    delete state.flags.ui.sideRefund;
+  }
+  if (state.flags.ui.v2Gift) {
+    delete state.flags.ui.v2Gift;
+    pending.push(['mom', { key: 'v2Gift', text: 'Má gom sẵn cho con mấy xấp ly, hộp, túi với khăn giấy rồi đó. Từ giờ mỗi phần bán ra tốn một cái ly/hộp — nhớ coi Kho mà nhập thêm nha con!' }]);
+  }
 
   // ───────────── load: offline earnings + mid-day resume ─────────────
   if (state.started && save && save.savedAt) {
@@ -105,8 +127,11 @@ export function createGame(save, opts = {}) {
       const rush = inRush(s.clock);
       if (rush !== w.rushOn) { w.rushOn = rush; G.emit('rush', { on: rush }); }
     }
+    deliverOrders(G);                       // app / nhà vườn deliveries arrive while the shop is open
+    quankhoRun(G, dtMin);                   // v2.5.2: the quản kho runs to the market when something runs low
     kitchen.updateTickets(G, dtMin);
     customers.spawnTick(G, dtMin);
+    customers.deliveryTick(G, dtMin);       // v2.6.9 xe máy giao hàng
     day.tickReservations(G, dtMin);
     customers.updateGroups(G, dtMin);
     rain.rainTick(G, dtMin, customers.angryLeave);
@@ -206,11 +231,45 @@ export function createGame(save, opts = {}) {
     pullTarp: wrap(() => rain.pullTarp(G)),
     addIngredient: wrap((ing) => kitchen.addIngredientAct(G, ing)),
     addDrinks: wrap(() => kitchen.addDrinksAct(G)),
+    addSides: wrap(() => kitchen.addSidesAct(G)),
+    setPack: wrap((box) => kitchen.setPackAct(G, box)),   // v2.6.14 ly / hộp
+    // v2.6.19: container for every new order (player's and staff's); null = each dish's own
+    setPackPref: wrap((box) => {
+      if (box != null && !C.CONTAINER_IDS.includes(box)) return fail('unknown', 'Không có loại này.');
+      state.packPref = box || null;
+      return { ok: true, packPref: state.packPref };
+    }),
+    liquidate: wrap((id, n) => liquidate(G, id, n)),
     serve: wrap((grade) => kitchen.serveAct(G, grade)),
     collect: wrap((tableIdx) => customers.collectCoins(G, tableIdx, 'player')),
     buyIngredient: wrap((ing, qty) => buyIngredient(G, ing, qty)),
+    buySupply: wrap((id, qty) => buySupply(G, id, qty)),
+    orderSupplies: wrap((supId, items) => placeOrder(G, supId, items)),
+    setSupplier: wrap((id) => {
+      if (!SUPPLIER[id]) return fail('unknown', 'Không có nhà cung cấp này.');
+      if (!supplierUnlocked(G, id)) return fail('locked', `${SUPPLIER[id].name} mở ở Lv ${SUPPLIER[id].unlockLv} nha!`);
+      state.supplier = id;
+      return { ok: true };
+    }),
+    /** price: whole k within priceBounds, or null to go back to the reference price. Never changes on its own. */
+    setPrice: wrap((potId, price) => {
+      if (!POT[potId]) return fail('unknown', 'Không có món này.');
+      if (!featureUnlocked(G, 'pricing')) return fail('locked', `Tự đặt giá bán mở ở Lv ${C.FEATURES.pricing} nha.`);
+      if (price == null) { delete state.prices[potId]; return { ok: true, price: null }; }
+      const v = Math.round(Number(price));
+      const b = priceBounds(potId);
+      if (!isFinite(v) || v <= 0) return fail('range', 'Giá phải lớn hơn 0 nha.');
+      if (v < b.min || v > b.max) return fail('range', `Giá ${POT[potId].name} chỉ đặt được từ ${fmtMoney(b.min)} đến ${fmtMoney(b.max)}.`);
+      state.prices[potId] = v;
+      G.counter('setPrice', 1);
+      return { ok: true, price: v };
+    }),
+    payStaffDebt: wrap((id, amount) => staff.payStaffDebt(G, id, amount)),
+    payOldDebt: wrap((idx) => staff.payOldDebt(G, idx)),
+    talkStaff: wrap((id) => staff.talkStaff(G, id)),
+    bonusStaff: wrap((id) => staff.bonusStaff(G, id)),
     setAutoRestock: wrap((on) => {
-      if (on && !(state.upgrades.supplier > 0 || mods(G).hasQuankho)) return fail('locked', 'Cần mua Mối chợ đầu mối hoặc thuê Quản kho trước nha.');
+      if (on && !mods(G).hasQuankho) return fail('locked', 'Thuê Quản kho trước nha, Quản kho sẽ tự nhập hàng mỗi sáng.');
       state.autoRestock = !!on;
       return { ok: true };
     }),
@@ -225,7 +284,7 @@ export function createGame(save, opts = {}) {
       addMoney(G, -info.cost, 'upgrade');
       state.upgrades[id]++;
       G.modsDirty = true;
-      if (id === 'table') { syncLayout(G, false); }
+      if (id === 'table' || id === 'sidetable') { syncLayout(G, false); }
       const pos = unitPos(id) || {};
       G.counter('upgrade:' + id, 1);
       G.emit('upgrade', { id, level: state.upgrades[id], x: pos.x, y: pos.y });
@@ -258,11 +317,47 @@ export function createGame(save, opts = {}) {
       G.modsDirty = true;
       return { ok: true };
     }),
+    // v2.3 looks: free to change once the level perk is unlocked
+    setBrand: wrap((patch) => {
+      if (state.level < C.BRAND.lv) return fail('locked', `Thiết kế tem logo mở ở Lv ${C.BRAND.lv} nha!`);
+      state.brand = sanitizeBrand({ ...state.brand, ...(patch || {}) });
+      G.emit('looks', { what: 'brand' });
+      return { ok: true, brand: state.brand };
+    }),
+    setUniform: wrap((patch) => {
+      if (state.level < C.UNIFORM.lv) return fail('locked', `Đồng phục mở ở Lv ${C.UNIFORM.lv} nha!`);
+      state.uniform = sanitizeUniform({ ...state.uniform, ...(patch || {}) });
+      G.emit('looks', { what: 'uniform' });
+      return { ok: true, uniform: state.uniform };
+    }),
+    setFacade: wrap((patch) => {
+      patch = patch || {};
+      for (const cat of Object.keys(patch)) {
+        const it = facadeItem(cat, patch[cat]);
+        if (!it) return fail('unknown', 'Không có món trang trí này.');
+        if (it.lv > state.level) return fail('locked', `${it.name} mở ở Lv ${it.lv} nha!`);
+      }
+      state.facade = sanitizeFacade({ ...state.facade, ...patch });
+      G.modsDirty = true;
+      G.emit('looks', { what: 'facade' });
+      return { ok: true, facade: state.facade };
+    }),
+    // v2.6.7: move the main shop to a city with an open branch (null = back to TP.HCM). Only the scene changes.
+    setHomeCity: wrap((id) => {
+      if (id == null || id === 'hcm') { state.homeCity = null; G.emit('looks', { what: 'city' }); G.toast('Quán chính về lại TP.HCM.', 'good', 'ui_shop'); return { ok: true, city: null }; }
+      const b = C.BRANCHES.find((x) => x.id === id);
+      if (!b) return fail('unknown', 'Không có thành phố này.');
+      if (!(state.branches[id] > 0)) return fail('locked', `Khai trương chi nhánh ${b.name} trước rồi mới dời quán chính tới đó được nha.`);
+      state.homeCity = id;
+      G.emit('looks', { what: 'city' });
+      G.toast(`Dời quán chính tới ${b.name}! Khung cảnh đã đổi.`, 'good', 'ui_map');
+      return { ok: true, city: id };
+    }),
     upgradeRecipe: wrap((potId) => {
       const p = POT[potId], r = state.recipes[potId];
       if (!p || !r) return fail('unknown', 'Không có công thức này.');
       if (!isPotUnlocked(G, potId)) return fail('locked', `${p.name} mở ở Lv ${p.unlockLv} nha!`);
-      if (r.lvl >= C.RECIPE.maxLevel) return fail('max', 'Công thức này đã tối đa rồi nha!');
+      if (r.lvl >= recipeMaxLevel(G)) return fail('max', 'Công thức này đã tối đa rồi nha!');
       const cost = C.RECIPE.upgradeCost(p, r.lvl);
       if (state.money + 1e-9 < cost) return fail('money', `Cần ${fmtMoney(cost)} để nâng công thức nha.`);
       addMoney(G, -cost, 'recipe');
@@ -296,6 +391,14 @@ export function createGame(save, opts = {}) {
     buyMarketing: wrap((id) => day.buyMarketing(G, id)),
     buyLottery: wrap(() => day.buyLottery(G)),
     claimMainQuest: wrap(() => quests.claimMain(G)),
+    claimV2Quest: wrap(() => quests.claimV2(G)),
+    /** Cấp thành thạo: open one of the gold chests earned from Lv 41 on. */
+    openMasteryChest: wrap(() => {
+      if (!(state.masteryChests > 0)) return fail('none', 'Chưa có rương thành thạo nào nha.');
+      state.masteryChests--;
+      const r = quests.openChest(G, C.MASTERY.chest);
+      return { ok: true, chest: C.MASTERY.chest, reward: r };
+    }),
     claimDaily: wrap((i) => quests.claimDaily(G, i)),
     claimDailyAll: wrap(() => quests.claimDailyAll(G)),
     claimLogin: wrap(() => quests.claimLogin(G)),
@@ -304,8 +407,9 @@ export function createGame(save, opts = {}) {
 
     setSpeed: wrap((v) => {
       v = Number(v);
-      if (![1, 2, 4, 8].includes(v)) return fail('unknown', 'Tốc độ này không có.');
+      if (![1, 2, 3, 4, 8].includes(v)) return fail('unknown', 'Tốc độ này không có.');
       if (v === 2 && !featureUnlocked(G, 'speed2')) return fail('locked', `Tốc độ ×2 mở ở Lv ${C.FEATURES.speed2} nha!`);
+      if (v === 3 && !featureUnlocked(G, 'speed3')) return fail('locked', `Tốc độ ×3 mở ở Lv ${C.FEATURES.speed3} nha!`);   // v2.6.10
       state.speed = v;
       return { ok: true, speed: v };
     }),
@@ -313,7 +417,12 @@ export function createGame(save, opts = {}) {
     resume: wrap((reason = 'ui') => { world.pauses.delete(reason); return { ok: true }; }),
     setSetting: wrap((key, value) => {
       if (!(key in state.settings)) return fail('unknown', 'Không có cài đặt này.');
-      if (key === 'dayMin') {
+      if (key === 'song') {                                   // v2.6.21 chọn bài nhạc nền
+        value = String(value);
+        const sg = C.SONGS.find((x) => x.id === value);
+        if (value !== 'auto' && !sg) return fail('unknown', 'Không có bài này.');
+        if (sg && ((state.upgrades.speaker | 0) < sg.lv)) return fail('locked', `Nâng Loa nhạc lên cấp ${sg.lv} để mở bài "${sg.name}" nha.`);
+      } else if (key === 'dayMin') {
         value = Math.round(Number(value));
         if (!C.TIME.dayMinOptions.includes(value)) return fail('range', 'Độ dài ngày này không có nha.');
       } else if (typeof state.settings[key] === 'number') value = clamp(Number(value) || 0, 0, 1);

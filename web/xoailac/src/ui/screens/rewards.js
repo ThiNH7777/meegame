@@ -17,7 +17,8 @@ export function openLevelUp(p = {}) {
       const cards = unlocks.map((u) => div('ul-card',
         div('ul-pic', ico(unlockIcon(u), 48)),
         span('ul-type', UNLOCK_LABEL[u.type] || 'Mới'),
-        h('b', null, u.name || u.id)));
+        h('b', null, u.name || u.id),
+        u.desc ? span('muted sm', u.desc) : null));
       cards.forEach((c, i) => { c.style.setProperty('--i', i); });
       const btn = h('button', { class: 'btn jade lg block', onclick: () => { sfx('click'); m.close('ok'); } }, unlocks.length ? 'Tuyệt vời!' : 'Cố lên nào!');
       return div('mbody cel',

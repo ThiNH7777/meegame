@@ -5,7 +5,7 @@ import { fmtMoney, fmtRating, fmtClock } from './format.js';
 import { newToday } from './state.js';
 import {
   addMoney, spend, tierDef, mods, autoRestock, rollMarket, salaryTotal, MARKETING_BY_ID, BRANCH_BY_ID, UP,
-  featureUnlocked, builtTables, isPotUnlocked, xpNeed, addXp, syncLots, expireStock,
+  featureUnlocked, builtTables, isPotUnlocked, xpNeed, addXp, syncLots, expireStock, deliverOrders, staffSalary, ambienceOf, perkFx, branchMaxLevel,
 } from './economy.js';
 import { syncLayout, makeActor, removeActor, setPath, stepActor } from './world.js';
 import { route } from './routing.js';
@@ -23,7 +23,8 @@ export function rollWeather(G, prev) {
   return G.rng.weighted(Object.keys(C.WEATHER), (id) => (id === 'storm' && prev === 'storm' ? 0 : C.WEATHER[id].weight)) || 'sun';
 }
 export function rollEvent(G) {
-  for (const e of G.rng.shuffle(C.EVENTS.slice())) if (G.rng.chance(e.chance)) return e.id;
+  const k = perkFx(G).eventChance;            // Lv 38 Mùa lễ hội
+  for (const e of G.rng.shuffle(C.EVENTS.slice())) if (G.rng.chance(e.chance * k)) return e.id;
   return null;
 }
 
@@ -103,8 +104,8 @@ export function openShop(G) {
   const s = G.state, w = G.world;
   if (!s.started) return fail('notStarted', 'Chưa bắt đầu game nha.');
   if (s.phase !== 'prep') return fail('phase', 'Quán đang mở cửa rồi.');
-  if (mods(G).hasQuankho) autoRestock(G, true);
-  else if (s.autoRestock && s.upgrades.supplier > 0) autoRestock(G, false);
+  deliverOrders(G);
+  if (mods(G).hasQuankho) autoRestock(G, true);   // v2.6.20: only the quản kho restocks (Mối vựa trái cây removed)
   s.phase = 'open';
   s.clock = C.TIME.dayStart;
   w.tMin = 0; w.rushOn = false; w.closingFor = 0;
@@ -131,11 +132,81 @@ export function closeEarly(G) {
   return { ok: true };
 }
 
+// ───────────── wages, wage debt, staff mood ─────────────
+export function wageDebtTotal(G) {
+  const s = G.state;
+  let t = 0;
+  for (const m of s.staff) t += m.owed || 0;
+  for (const d of s.wageDebt) t += d.amount || 0;
+  return round2(t);
+}
+export const MOOD_TEXT = (m) => { for (const [min, label, key] of C.MOOD.levels) if ((m.mood ?? C.MOOD.start) >= min) return { label, key }; return { label: C.MOOD.levels[3][1], key: 'risk' }; };
+const atRisk = (m) => (m.mood ?? C.MOOD.start) < C.MOOD.warnBelow || (m.owedDays || 0) >= C.MOOD.owedQuitDays;
+
+/** Closing: pay each person's salary from the till. Unpaid → m.owed (+ owedDays). Then mood drifts / drops and
+ *  people who were warned and are still unhappy hand in their notice. Never creates money. */
+function payWages(G) {
+  const s = G.state, t = s.today, M = C.MOOD;
+  const notes = (t.staffNotes = t.staffNotes || []);
+  const ambTarget = M.base + ambienceOf(G) * M.ambienceBase + (s.upgrades.tablestyle || 0) * 2 + perkFx(G).moodBase;
+  for (const m of s.staff.slice()) {
+    const sal = staffSalary(G, m);
+    t.costs.salary = round2((t.costs.salary || 0) + sal);           // the wage is a cost of today whether paid or owed
+    const pay = Math.min(sal, Math.max(0, s.money));
+    if (pay > 0) addMoney(G, -pay, 'salary');
+    const short = round2(sal - pay);
+    if (short > 0.005) { m.owed = round2((m.owed || 0) + short); t.salaryOwed = round2((t.salaryOwed || 0) + short); }
+    if ((m.owed || 0) > 0.005) {
+      m.owedDays = (m.owedDays || 0) + 1;
+      m.mood = clamp((m.mood ?? M.start) - M.owedHit - M.owedPerDay * (m.owedDays - 1), 0, 100);
+    } else {
+      m.owedDays = 0; m.owed = 0;
+      const v = m.mood ?? M.start;
+      m.mood = clamp(v + (ambTarget - v) * M.drift + M.paidBonus, 0, 100);
+    }
+    m.mood = Math.round(m.mood);
+    // notice: warn first, leave only if nothing improves for quitAfterDays closings
+    if (atRisk(m)) {
+      if (m.quitWarnDay == null) {
+        m.quitWarnDay = s.day;
+        notes.push({ id: m.id, type: 'warn', name: m.name });
+        G.emit('staffWarn', { staff: m });
+        G.momText('warn_' + m.id + '_' + s.day, `${m.name} nói nhỏ với Má: "${m.owed > 0 ? 'Nợ lương ' + m.owedDays + ' ngày rồi' : 'Dạo này con mệt quá'}… ${C.MOOD.quitAfterDays} hôm nữa không khá hơn là con xin nghỉ." Trả lương hoặc nói chuyện với ${m.name} trong mục Nhân viên nha con.`);
+      } else if (s.day - m.quitWarnDay >= M.quitAfterDays) {
+        quitStaff(G, m);
+        notes.push({ id: m.id, type: 'quit', name: m.name });
+      }
+    } else if (m.quitWarnDay != null) {
+      m.quitWarnDay = null;
+      notes.push({ id: m.id, type: 'stay', name: m.name });
+      G.emit('staffStay', { staff: m });
+    }
+  }
+}
+/** Quest counter: closings in a row with at least one staff member and no wage debt at all. */
+function wageStreak(G) {
+  const s = G.state, c = s.quests.counters;
+  const clean = s.staff.length > 0 && s.staff.every((m) => !(m.owed > 0.005)) && !s.wageDebt.some((d) => d.amount > 0.005);
+  c.noDebtNow = clean ? (c.noDebtNow || 0) + 1 : 0;
+  c.noDebtBest = Math.max(c.noDebtBest || 0, c.noDebtNow);
+}
+/** Someone leaves: whatever they are still owed stays as debt to them (paid from the Nhân viên sheet). */
+export function quitStaff(G, m) {
+  const s = G.state;
+  const i = s.staff.indexOf(m);
+  if (i < 0) return;
+  s.staff.splice(i, 1);
+  if ((m.owed || 0) > 0.005) s.wageDebt.push({ name: m.name, role: m.role, amount: round2(m.owed), since: s.day });
+  G.modsDirty = true; G.workersDirty = true;
+  G.emit('staffQuit', { staff: m });
+  G.toast(`${m.name} đã nghỉ việc${m.owed > 0 ? ' — quán còn nợ ' + fmtMoney(m.owed) + ' lương' : ''}.`, 'bad', 'ui_staff');
+}
+
 function payFixed(G, key, amount, label) {
   if (!(amount > 0)) return 0;
   const paid = spend(G, key, amount, key);
   if (paid + 1e-6 < amount) {
-    G.momText('shortfall_' + key, `Con ơi, ${label} thiếu ${fmtMoney(amount - paid)}, Má bù cho lần này. Mai làm ăn khá hơn nha!`);
+    G.momText('shortfall_' + key, `Con ơi, ${label} còn thiếu ${fmtMoney(amount - paid)}, chủ mặt bằng cho khất lần này thôi đó. Mai làm ăn khá hơn nha!`);
   }
   return paid;
 }
@@ -149,7 +220,7 @@ export function buildReport(G) {
   const rep = {
     day: s.day, weather: s.weather, event: s.event,
     revenue: round2(t.revenue), tips: round2(t.tips), costs: Object.assign({}, t.costs), costTotal: costSum(t), profit: dayProfit(t),
-    served: t.served, angry: t.angry, lost: t.lost, fiveStars: t.fiveStars, potsSold: t.potsSold, drinksSold: t.drinksSold,
+    served: t.served, angry: t.angry, lost: t.lost, fiveStars: t.fiveStars, potsSold: t.potsSold, drinksSold: t.drinksSold, sidesSold: t.sidesSold || 0, delivered: t.delivered || 0, deliveryMissed: t.deliveryMissed || 0,
     avgStars: t.rated ? t.stars / t.rated : 0,
     bestReview: s.reviews.find((r) => r.id === t.bestReviewId) || null,
     comboMax: t.comboMax, newKinds: t.newKinds.slice(),
@@ -158,6 +229,8 @@ export function buildReport(G) {
     xpAfter: s.xp, xpNeed: xpNeed(s.level),
     forecast: forecastInfo(G), reservationsTomorrow: s.reservations.map((r) => Object.assign({}, r)),
     goalHint: '', money: s.money,
+    priceLost: t.priceLost || 0, seated: t.seated || 0, supplyMiss: Object.assign({}, t.supplyMiss || {}),
+    salaryOwed: round2(t.salaryOwed || 0), wageDebtTotal: wageDebtTotal(G), staffNotes: (t.staffNotes || []).slice(),
   };
   rep.goalHint = goalHint(G);
   s.report = rep;
@@ -180,8 +253,9 @@ export function finishDay(G) {
   if (won > 0) addMoney(G, won, 'lottery');
   t.lotteryWon = won; t.lotteryTickets = tickets;
   s.lottery.tickets = 0;
-  // fixed costs
-  payFixed(G, 'salary', salaryTotal(G), 'tiền lương nhân viên');
+  // fixed costs: wages person by person (what the till cannot cover becomes wage debt), then rent
+  payWages(G);
+  wageStreak(G);
   payFixed(G, 'rent', tierDef(G).rent, 'tiền thuê mặt bằng');
   // lifetime stats
   const profit = dayProfit(t);
@@ -191,6 +265,7 @@ export function finishDay(G) {
   st.bestDayProfit = Math.max(st.bestDayProfit, profit);
   st.avgDayProfit = st.daysPlayed <= 1 ? profit : round2(st.avgDayProfit * 0.7 + profit * 0.3);
   s.usageYesterday = Object.assign({}, t.usage);
+  s.supplyUseYesterday = Object.assign({}, t.supplyUse);
   s.soldOutYesterday = !!t.soldOut;            // sold out → yesterday's usage undercounts demand
   // tomorrow
   if (s.viral.days > 0) { s.viral.days--; if (s.viral.days <= 0) s.viral = { days: 0, mult: 1 }; }
@@ -219,6 +294,7 @@ export function startNextDay(G) {
   s.report = null;
   syncLots(G);
   expireStock(G);                                  // past-date portions go in the bin before the market opens
+  deliverOrders(G);                                // the vựa's truck / evening orders arrive in the morning
   w.lowWarned = {}; w.outWarned = {};
   resetCustomers(G);
   resetWorkers(G);
@@ -352,7 +428,7 @@ export function updateBranches(G, dtReal) {
 function checkEnding(G) {
   const s = G.state;
   if (s.ended) return;
-  if (C.BRANCHES.every((b) => s.branches[b.id] > 0)) {
+  if (C.BRANCHES.filter((b) => !b.bonus).every((b) => s.branches[b.id] > 0)) {
     s.ended = true;
     G.mom('ending');
     G.emit('ending', {});
@@ -363,6 +439,7 @@ export function openBranch(G, id) {
   if (!b) return fail('unknown', 'Không có chi nhánh này.');
   if (s.tier < 5) return fail('tier', 'Mở Chuỗi Xoài Lắc Nhà Mình rồi mới mở chi nhánh được nha!');
   if (s.branches[id] > 0) return fail('opened', 'Chi nhánh này mở rồi nha.');
+  if (b.minLevel && s.level < b.minLevel) return fail('locked', `Chi nhánh ${b.name} mở ở Lv ${b.minLevel} nha.`);
   if (s.money + 1e-9 < b.cost) return fail('money', `Mở chi nhánh ${b.name} cần ${fmtMoney(b.cost)} nha.`);
   addMoney(G, -b.cost, 'branch');
   s.branches[id] = 1;
@@ -375,7 +452,7 @@ export function upgradeBranch(G, id) {
   if (!b) return fail('unknown', 'Không có chi nhánh này.');
   const lvl = s.branches[id] || 0;
   if (lvl <= 0) return fail('closed', 'Mở chi nhánh trước đã nha.');
-  if (lvl >= C.BRANCH.maxLevel) return fail('max', 'Chi nhánh đã tối đa rồi nha.');
+  if (lvl >= branchMaxLevel(G)) return fail('max', 'Chi nhánh đã tối đa rồi nha.');
   const cost = C.BRANCH.upgradeCost(b, lvl);
   if (s.money + 1e-9 < cost) return fail('money', `Nâng cấp cần ${fmtMoney(cost)} nha.`);
   addMoney(G, -cost, 'branch');

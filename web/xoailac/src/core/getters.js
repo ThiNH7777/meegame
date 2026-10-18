@@ -2,11 +2,16 @@
 import * as C from '../config.js';
 import {
   ING, POT, UP, xpNeed, tierDef, builtTables, builtStoves, khoInfo, buyPrice as baseBuyPrice, potPrice, masteryStars,
-  ambienceOf, featureUnlocked, isPotUnlocked, isIngUnlocked, isDrinkUnlocked, salaryTotal, staffSalary,
+  ambienceOf, featureUnlocked, isPotUnlocked, isIngUnlocked, liquidateQuote, oldStock, isDrinkUnlocked, salaryTotal, staffSalary,
+  sellPrice, priceBounds, portionCost, menuPriceDemand, SUPPLY, SUPPLIER, supplierUnlocked, supplierSells, supplierPrice, quoteOrder,
+  supplyPrice, supplyUnitCost, suppliesWanted, isFresh, recipeMaxLevel, branchMaxLevel, perkFx,
 } from './economy.js';
+import { refuseChance } from './customers.js';
+import { moodBand } from './workers.js';
+import { owedTotal } from './staff.js';
 import { staffSlots, roleUnlocked, roleCount, candidatesOf } from './staff.js';
 import { trayStatus } from './kitchen.js';
-import { mainQuestInfo, dailyTasks, loginInfo } from './quests.js';
+import { mainQuestInfo, dailyTasks, loginInfo, v2QuestInfo, questXp } from './quests.js';
 import { tierInfo, forecastInfo } from './day.js';
 import { raining, exposed, needsTarp, ownsTarp, tarpOpen, weatherNow, nextShowerIn } from './rain.js';
 
@@ -67,6 +72,8 @@ export function createGetters(G) {
       levelName = names ? names[Math.min(level, names.length - 1)] : level ? 'Đã có' : 'Chưa có';
       if (level < max) nextLevelName = names ? names[Math.min(level + 1, names.length - 1)] : max === 1 ? 'Đã có' : 'Cấp ' + (level + 1);
       if (cost != null && up.minTier && up.minTier[level] > s.tier) lockedReason = `Cần ${C.TIERS[up.minTier[level] - 1].name}`;
+      if (cost != null && id === 'sidetable' && !featureUnlocked(G, 'sideUp')) lockedReason = `Cần Lv ${C.FEATURES.sideUp}`;
+      if (cost != null && up.minLv && (up.minLv[level] || 1) > s.level) lockedReason = `Cần Lv ${up.minLv[level]}`;
     }
     return { level, max, cost, canBuy: cost != null && !lockedReason && s.money + 1e-9 >= cost, lockedReason, levelName, nextLevelName };
   }
@@ -76,7 +83,7 @@ export function createGetters(G) {
     const p = POT[potId];
     if (!p) return null;
     const r = s.recipes[potId] || { lvl: 1, sold: 0 };
-    const max = C.RECIPE.maxLevel;
+    const max = recipeMaxLevel(G);
     const cost = r.lvl >= max ? null : C.RECIPE.upgradeCost(p, r.lvl);
     const stars = masteryStars(G, potId);
     const nextMastery = C.RECIPE.masteryAt[stars] ?? null;
@@ -110,13 +117,12 @@ export function createGetters(G) {
     const used = new Set();
     for (const p of C.HOTPOTS) if (s.menu[p.id] && isPotUnlocked(G, p.id)) for (const i of p.recipe) used.add(i);
     for (const i of used) if (isIngUnlocked(G, i) && (s.inventory[i] || 0) < 5 && s.money >= baseBuyPrice(G, i) && khoInfo(G).used < khoInfo(G).cap) { kho = true; break; }
-    if (!kho && s.upgrades.supplier > 0 && !s.autoRestock) kho = true;
     // menu: recipe upgrade affordable or a new pot not yet looked at
     let menu = false;
     for (const p of C.HOTPOTS) {
       if (!isPotUnlocked(G, p.id)) continue;
       const r = s.recipes[p.id];
-      if (r.lvl < C.RECIPE.maxLevel && s.money >= C.RECIPE.upgradeCost(p, r.lvl)) menu = true;
+      if (r.lvl < recipeMaxLevel(G) && s.money >= C.RECIPE.upgradeCost(p, r.lvl)) menu = true;
       if (p.unlockLv > 1 && r.sold === 0 && !s.flags.seenUnlock['pot:' + p.id]) menu = true;
     }
     if (s.flags.ui && s.flags.ui.menuNudge && !s.flags.ui.menuNudgeSeen) menu = true;   // Má pointed the player here
@@ -135,7 +141,7 @@ export function createGetters(G) {
       }
     }
     // shop
-    let shop = !!s.quests.mainClaimable;
+    let shop = !!s.quests.mainClaimable || !!s.quests.v2Claimable;
     if (!shop && featureUnlocked(G, 'daily')) for (const e of dailyTasks(G)) if (e.done && !e.claimed) { shop = true; break; }
     if (!shop && loginInfo(G).canClaim && s.started) shop = true;
     if (!shop) for (const r of s.reviews) if (r.stars >= 5 && !r.thanked) { shop = true; break; }
@@ -182,7 +188,58 @@ export function createGetters(G) {
     return set;
   }
 
+  // ───────────── v2: prices, supplies, suppliers, wages ─────────────
+  /** Menu pricing row: reference, chosen price, cost, profit, bounds and how a typical guest reacts. */
+  function priceInfo(potId) {
+    const p = POT[potId];
+    if (!p) return null;
+    const ref = potPrice(G, potId), price = sellPrice(G, potId), cost = portionCost(G, potId), b = priceBounds(potId);
+    // refuse chance averaged over the customer kinds of this tier, weighted like arrivals
+    let wsum = 0, rsum = 0;
+    for (const id of Object.keys(C.CUSTOMERS)) {
+      const k = C.CUSTOMERS[id];
+      if (!k.weight || k.minTier > s.tier) continue;
+      const w = k.weight * ((k.prefers && k.prefers[potId]) ?? 0.5);
+      wsum += w; rsum += w * refuseChance(G, id, potId);
+    }
+    const refuse = wsum ? rsum / wsum : 0;
+    const ratio = price / Math.max(1, ref);
+    return { id: potId, ref, price, custom: typeof s.prices[potId] === 'number', cost, profit: Math.round((price - cost) * 10) / 10, min: b.min, max: b.max, ratio, refuse,
+      band: ratio < 0.9 ? 'cheap' : ratio > 1.12 ? 'pricey' : 'normal' };
+  }
+  function supplyInfo() {
+    const want = suppliesWanted(G);
+    return C.SUPPLIES.map((x) => {
+      const used = (s.supplyUseYesterday && s.supplyUseYesterday[x.id]) || 0;
+      const have = s.supplies[x.id] || 0;
+      let incoming = 0;
+      for (const o of s.orders) incoming += (o.items && o.items[x.id]) || 0;
+      return { ...x, have, incoming, used, needed: !!want[x.id], avg: supplyUnitCost(G, x.id), price: supplyPrice(G, x.id, 1),
+        low: !!want[x.id] && have < Math.max(10, used * 0.5), target: Math.max(30, Math.ceil(used * 1.3)) };
+    });
+  }
+  function suppliers() {
+    return C.SUPPLIERS.map((x) => ({ ...x, unlocked: supplierUnlocked(G, x.id), active: s.supplier === x.id,
+      canNow: !(x.prepOnly && (s.phase === 'open' || s.phase === 'closing' || s.phase === 'report')) }));
+  }
+  function staffMood(m) {
+    const band = moodBand(m);
+    const lv = C.MOOD.levels.find((l) => l[2] === band);
+    return { mood: Math.round(m.mood ?? C.MOOD.start), band, label: lv ? lv[1] : '', owed: m.owed || 0, owedDays: m.owedDays || 0,
+      warned: m.quitWarnDay != null, leavesIn: m.quitWarnDay != null ? Math.max(0, C.MOOD.quitAfterDays - (s.day - m.quitWarnDay)) : null,
+      talked: m.talkDay === s.day, bonused: m.bonusDay === s.day, bonusCost: Math.max(1, Math.round(staffSalary(G, m) * C.MOOD.bonus.mult)) };
+  }
+
   return {
+    priceInfo, supplyInfo, suppliers, staffMood,
+    branchMax: () => branchMaxLevel(G), recipeMax: () => recipeMaxLevel(G), perks: () => perkFx(G),
+    menuPriceDemand: () => menuPriceDemand(G),
+    supplierPrice: (supId, id, qty) => supplierPrice(G, supId, id, qty),
+    supplierSells: (supId, id) => !!SUPPLIER[supId] && supplierSells(SUPPLIER[supId], id),
+    quoteOrder: (supId, items) => quoteOrder(G, supId, items),
+    isFresh,
+    wageDebt: () => owedTotal(G),
+    sideTables: () => (G.world.side || []).length,
     level, kho, buyPrice,
     buyPriceBase: (id) => baseBuyPrice(G, id),
     potPrice: (id) => potPrice(G, id),
@@ -190,12 +247,15 @@ export function createGetters(G) {
     unlocked: (key) => featureUnlocked(G, key),
     isPotUnlocked: (id) => isPotUnlocked(G, id),
     isIngUnlocked: (id) => isIngUnlocked(G, id),
+    liquidateQuote: (id, n) => liquidateQuote(G, id, n),   // v2.6 thanh lý
+    oldStock: (id) => oldStock(G, id),
     isDrinkUnlocked: (id) => isDrinkUnlocked(G, id),
     availablePots, upgradeInfo, recipeInfo, candidates,
     tierInfo: () => tierInfo(G),
     staffSlots: () => staffSlots(G),
     salaryTotal: () => salaryTotal(G),
     mainQuest: () => mainQuestInfo(G),
+    v2Quest: () => v2QuestInfo(G),
     dailyTasks: () => dailyTasks(G),
     loginInfo: () => loginInfo(G),
     dots, trayInfo, hint,
@@ -203,6 +263,7 @@ export function createGetters(G) {
     tables: () => builtTables(G),
     stoves: () => builtStoves(G),
     weatherNow: () => weatherNow(G),
+    questXp: (kind, base) => questXp(G, kind, base),   // v2.6.11
     rain: () => ({ raining: raining(G), exposed: exposed(G), needsTarp: needsTarp(G), owns: ownsTarp(G), tarp: tarpOpen(G), next: nextShowerIn(G) }),
   };
 }

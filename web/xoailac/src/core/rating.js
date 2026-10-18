@@ -2,7 +2,7 @@
 import * as C from '../config.js';
 import { clamp } from './util.js';
 import { fill } from './format.js';
-import { POT, ambienceOf, mods, potPrice, tierDef, eventDef } from './economy.js';
+import { POT, ambienceOf, mods, potPrice, sellPrice, tierDef, eventDef, perkFx } from './economy.js';
 
 const SAT = C.SAT;
 
@@ -21,7 +21,7 @@ export function makerBonus(G, maker) {
 export function qualityOf(G, potId, maker) {
   const s = G.state, up = s.upgrades;
   const lvl = (s.recipes[potId] && s.recipes[potId].lvl) || 1;
-  return SAT.baseQuality + (lvl - 1) * C.RECIPE.qualityPerLevel + makerBonus(G, maker) + up.stovetype * SAT.stoveQualityPer + up.knife * SAT.knifeQualityPer;
+  return SAT.baseQuality + (lvl - 1) * C.RECIPE.qualityPerLevel + makerBonus(G, maker) + up.stovetype * SAT.stoveQualityPer + up.knife * SAT.knifeQualityPer + perkFx(G).quality + mods(G).eqQuality;   // v2.6.9: hũ lắc, bồn rửa tay, máy ép ly
 }
 
 function waitBonus(ratio) {
@@ -40,9 +40,17 @@ export function scoreGroup(G, g) {
   const likes = !!k.likesAmbience;
   const ev = eventDef(G);
   const budget = k.budget * (ev && ev.budgetMult && g.kind === 'vanphong' ? ev.budgetMult : 1);
-  const priceRatio = potPrice(G, potId) * (info.priceMult || 1) / budget;
+  const paid = (g.price != null ? g.price : sellPrice(G, potId)) * (info.priceMult || 1);
+  const priceRatio = paid / budget;
+  const over = paid / Math.max(1, potPrice(G, potId));     // vs the reference price: value for money
   const charm = charmBonus(G);
-  let score = SAT.base + SAT.qualityWeight * (quality - SAT.baseQuality);
+  const ingQ = info.ingQ || 0;                               // supplier quality (vựa sỉ −, nhà vườn +)
+  let score = SAT.base + SAT.qualityWeight * (quality + ingQ - SAT.baseQuality);
+  const P = C.PRICING;
+  score += clamp((1 - over) * P.valueW, P.valueMin, P.valueMax);
+  if (g.seated) score += C.SIDE.satBonus + (likes ? C.SIDE.ambienceBonus : 0);   // sat down to eat in comfort
+  score -= C.SUPPLY_MISS_SAT * (g.supplyMiss || 0);
+  score += perkFx(G).satBonus;                               // Ly in logo quán         // no bag / napkins / skewer
   const wRatio = info.waitRatio ?? 0.5;
   score += waitBonus(wRatio);
   score += SAT.ambienceWeight * amb * (likes ? 1.5 : 1);
@@ -57,7 +65,7 @@ export function scoreGroup(G, g) {
   if (info.shake) score += C.SHAKE.score[info.shake] || 0;
   score += (rng.next() * 2 - 1) * SAT.noise;
   const stars = clamp(Math.round(score), 1, 5);
-  return { score, stars, f: { wRatio, quality, amb, likes, priceRatio, charm, hot, uncoveredRain } };
+  return { score, stars, f: { wRatio, quality: quality + ingQ, amb, likes, priceRatio, over, charm, hot, uncoveredRain } };
 }
 
 // ───────────── rating average ─────────────
@@ -86,14 +94,14 @@ function tagFor(G, g, stars, f) {
     if (f.wRatio < C.COMBO.fastRatio) add('fast', 1);
     if (f.quality - SAT.baseQuality > 0.25) add('quality', 0.6);
     if (f.amb * (f.likes ? 1.5 : 1) > 0.5) add('ambience', 0.7);
-    if (f.priceRatio < 0.7) add('cheap', 0.6);
+    if (f.priceRatio < 0.7 || f.over < 0.85) add('cheap', f.over < 0.85 ? 0.9 : 0.6);
     if (G.state.weather === 'rain' && !f.uncoveredRain) add('rain', 0.5);
     if (G.state.weather === 'cold') add('cold', 0.5);
     if (f.charm > 0.15) add('staff', 0.4);
     if ((g.extrasServed || 0) > 0) add('extra', 0.5);
   } else {
     if (f.wRatio > 0.6) add('slow', 1);
-    if (f.priceRatio > 1.1) add('pricey', 0.7);
+    if (f.priceRatio > 1.1 || f.over > 1.25) add('pricey', f.over > 1.25 ? 1 : 0.7);
     if (f.hot) add('hot', 0.8);
     if (g.substitute) add('substitute', 0.8);
   }

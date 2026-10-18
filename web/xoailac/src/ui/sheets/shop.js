@@ -8,6 +8,7 @@ import { fmtShort, fmtMoney, fmtRating, fmtClock } from '../../core/format.js';
 import { secTitle, noteBox, stars, celebrate, floatAt, costBtn, lockCard, portrait } from './common.js';
 import { questsView } from './quests.js';
 import { expandView, branchesView } from './expand.js';
+import { brandCard, facadeCard } from '../looks.js';
 
 // ------------------------------------------------------------------ Trang trí
 function decoThumb(id, size = 48) {
@@ -19,10 +20,13 @@ function decoThumb(id, size = 48) {
 
 function decoView(body, api) {
   const s = S();
-  if (!D.featureOn('deco')) { body.appendChild(lockCard('Trang trí quán', `Mở ở Lv ${C.FEATURES.deco}. Đèn lồng, cây kiểng, tranh Đông Hồ… làm quán xinh hơn, khách vui hơn.`, 'ui_deco')); return; }
+  if (!D.featureOn('deco')) { body.appendChild(lockCard('Trang trí quán', `Mở ở Lv ${C.FEATURES.deco}. Đèn lồng, cây kiểng, cờ dây, chậu hoa… làm quán xinh hơn, khách vui hơn.`, 'ui_deco')); return; }
   const amb = G().get?.ambience?.() ?? 0;
   body.appendChild(div('card amb', ico('ui_heart', 32), div('grow', div('amb-t', h('b', null, 'Không khí quán'), span('num', Math.round(amb * 100) + '%')),
     div('bar ' + (amb > 0.66 ? '' : 'jade'), h('i', { style: { '--p': amb * 100 } })), span('muted sm', 'Không khí đẹp thì khách kiên nhẫn và tip nhiều hơn.')),));
+  body.appendChild(secTitle('Mặt tiền quán'));
+  body.appendChild(facadeCard(api));
+  if ((s.level || 1) >= C.BRAND.lv - 4) body.appendChild(brandCard(api));
   const owned = new Set(s.deco?.owned || []);
   C.DECO_CATS.forEach((cat) => {
     const eq = s.deco?.equipped?.[cat.id];

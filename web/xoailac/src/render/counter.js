@@ -4,11 +4,15 @@
 // (drawn ×1), customers stepping up to the counter (growing to ×2 as they come closer), the wooden counter in
 // front, order bubbles, weather, lighting and particles. World px (layout COUNTER, core 200×150) → detail buffer
 // (DETAIL px per world px) → integer upscale onto #scene, then hi-res text.
-import { drawBubble, drawParticle, drawWeather, drawCanopy, drawLighting, drawChar, drawIcon, makeLook } from '../art/index.js';
+import { drawBubble, drawParticle, drawWeather, drawCanopy, drawLighting, drawChar, drawIcon, makeLook, drawSideTable, setUniform } from '../art/index.js';
+import { createExtras, SIGN_STYLES } from './extras.js';
+import { bandFor, MATS } from './counterMat.js';
+import { activeLooks } from '../core/looks.js';
 import { loadAtlas, DETAIL } from '../art/assets.js';
 import { BACKDROPS, COUNTER_ART } from '../art/data/counter.js';
 import { PAL } from '../art/palette.js';
-import { TIME, RAIN } from '../config.js';
+import { TIME, RAIN, INGREDIENTS, BRANCHES } from '../config.js';
+const ING_ICON = Object.fromEntries(INGREDIENTS.map((i) => [i.id, i.icon]));
 import { fmtShort } from '../core/format.js';
 import { createCamera } from './camera.js';
 import { createFx, FONT_BUNGEE } from './fx.js';
@@ -25,6 +29,8 @@ export function createCounterRenderer(canvas, game) {
   const cam = createCamera(DETAIL);
   const fx = createFx();
   const amb = createAmbient();
+  const extras = createExtras(game);
+  let looksNow = { brand: null, uniform: null, facade: null };
   const counterRec = loadAtlas(COUNTER_ART.file);
   const CF = COUNTER_ART.frames;
 
@@ -161,7 +167,7 @@ export function createCounterRenderer(canvas, game) {
   });
   on('combo', (e) => {
     if (e.x == null) return;
-    fx.text('Combo x' + e.n + '!', e.x, e.y - 46, e.n >= 5 ? PAL.coral : PAL.gold1, 1, 5.5 + Math.min(e.n, 8) * 0.3, 1.35, 22);
+    fx.text('Combo x' + e.n + '!', e.x, e.y - 46, e.n >= 5 ? PAL.coral : PAL.gold1, 1, 4.5 + Math.min(e.n, 8) * 0.2, 1.1, 18);
     if (e.n >= 4) fx.burst('confetti', e.x, e.y - 40, Math.min(18, 6 + e.n * 2), 50, 0.9, 120, 0.5);
   });
   on('review', (e) => {
@@ -193,13 +199,20 @@ export function createCounterRenderer(canvas, game) {
 
   // ───────────── backdrop ─────────────
   const bgRecs = {};
+  /** v2.6.7: the main shop moved to a branch city → that city's backdrop (the layout itself stays the tier's) */
+  function cityScene() {
+    const id = game.state.homeCity;
+    if (!id) return null;
+    const b = BRANCHES.find((x) => x.id === id);
+    return b && b.scene && BACKDROPS[b.scene] ? b.scene : null;
+  }
   function backdrop(scene) {
     const m = BACKDROPS[scene] || BACKDROPS.vihe;
     if (!bgRecs[scene]) bgRecs[scene] = loadAtlas(m.file);
     return { m, img: bgRecs[scene].img };
   }
   function drawBackdrop(L) {
-    const { m, img } = backdrop(L.scene);
+    const { m, img } = backdrop(cityScene() || L.scene);
     const C = L.counter;
     const vw = view.x1 - view.x0;
     // world size of the image at 1:1 (DETAIL px per world px); widen when the view is wider than the art
@@ -253,28 +266,27 @@ export function createCounterRenderer(canvas, game) {
   }
   const nightOf = (clock) => clock >= 19 * 60 ? 1 : clock >= 17.5 * 60 ? (clock - 17.5 * 60) / 90 : 0;
 
+  const counterMat = () => Math.max(0, Math.min(4, (game.state.upgrades && game.state.upgrades.stovetype) | 0));
   // ───────────── counter ─────────────
   function drawCounter(L) {
     const img = counterRec.img, C = L.counter;
     if (!img) { bctx.fillStyle = '#c98a4b'; bctx.fillRect(view.x0, C.top, view.x1 - view.x0, view.y1 - C.top); return; }
     const b = CF.band, bwW = b[2] / DETAIL, bhW = b[3] / DETAIL;
-    // prop clusters on the outer sides, never in front of a counter spot
-    const tbs = game.world.tables;
-    let lEdge = C.w / 2, rEdge = C.w / 2;
-    if (tbs.length) { lEdge = tbs[0].x - C.slotW / 2 + 2; rEdge = tbs[tbs.length - 1].x + C.slotW / 2 - 2; }
     // band, tiled from the centre outwards (so the seams are symmetric)
     const start = Math.floor((view.x0 - C.w / 2) / bwW) - 1, end = Math.ceil((view.x1 - C.w / 2) / bwW) + 1;
-    for (let i = start; i <= end; i++) bctx.drawImage(img, b[0], b[1], b[2], b[3], C.w / 2 + i * bwW, C.top, bwW, bhW);
-    if (C.top + bhW < view.y1) { bctx.fillStyle = '#7a4a22'; bctx.fillRect(view.x0, C.top + bhW, view.x1 - view.x0, view.y1 - C.top - bhW); }
-    const l = CF.left, r = CF.right;
-    bctx.drawImage(img, l[0], l[1], l[2], l[3], Math.round(lEdge - l[2] / DETAIL), C.top + l[4] / DETAIL, l[2] / DETAIL, l[3] / DETAIL);
-    bctx.drawImage(img, r[0], r[1], r[2], r[3], Math.round(rEdge), C.top + r[4] / DETAIL, r[2] / DETAIL, r[3] / DETAIL);
+    const mat = counterMat(), tile = bandFor(img, b, mat);          // v2.5: material follows the Quầy sơ chế level
+    for (let i = start; i <= end; i++) {
+      if (tile) bctx.drawImage(tile, 0, 0, b[2], b[3], C.w / 2 + i * bwW, C.top, bwW, bhW);
+      else bctx.drawImage(img, b[0], b[1], b[2], b[3], C.w / 2 + i * bwW, C.top, bwW, bhW);
+    }
+    if (C.top + bhW < view.y1) { bctx.fillStyle = ['#7a4a22', '#6e4422', '#24604c', '#3e4850', '#141f33'][mat] || '#7a4a22'; bctx.fillRect(view.x0, C.top + bhW, view.x1 - view.x0, view.y1 - C.top - bhW); }
+    // v2.5.1: the fruit basket / salt jars (and the wooden slab painted under them) are gone: the counter shows its own material end to end
   }
 
   // ───────────── characters ─────────────
   const drawList = [];
   function drawActor(a, look, s) {
-    aOpts.pose = a.pose === 'sit' || a.pose === 'eat' ? 'idle' : a.pose;
+    aOpts.pose = a.pose === 'eat' ? 'idle' : a.pose;          // 'sit' only happens at the side tables
     aOpts.facing = a.facing; aOpts.carry = null; aOpts.alpha = a.alpha == null ? 1 : a.alpha;
     aOpts.t = time + (a.id % 13) * 0.37;
     const x = Math.round(a.x * DETAIL) / DETAIL, y = Math.round(a.y * DETAIL) / DETAIL;
@@ -287,10 +299,11 @@ export function createCounterRenderer(canvas, game) {
   }
   /** the leader of a served group holds the cup in front of them */
   function drawCup(g, a, s) {
-    if (!g.pot || g.angry) return;
+    if (!g.pot || g.angry || g.seated) return;           // seated groups have their cups on the table
     if (!(g.state === 'eating' || g.state === 'billing' || (g.state === 'leaving' && g.info))) return;
     const sz = 0.62 * s;                                 // icon scale (16 world px × sz)
     drawIcon(bctx, 'pot_' + g.pot, Math.round(a.x + 1 * s - 8 * sz), Math.round(a.y - 15 * s - 8 * sz), sz);
+    extras.addCup(Math.round(a.x + 1 * s - 8 * sz) + 8 * sz, Math.round(a.y - 15 * s - 8 * sz) + 8 * sz, 16 * sz);
   }
 
   // ───────────── bubbles ─────────────
@@ -310,7 +323,7 @@ export function createCounterRenderer(canvas, game) {
       case 'eating': {
         const ex = g.extraTicket;
         if (ex && ex.status !== 'dead' && ex.status !== 'done' && ex.extra) {
-          bc.icon = 'ing_' + ex.extra;
+          bc.icon = ING_ICON[ex.extra] || 'ing_' + ex.extra;   // fruit extras use fr_* icons
           bo.patience = 1 - ex.waited / ex.patience;
           bo.pulse = bo.patience < 0.3;
         } else bc.icon = 'emo_yum';
@@ -324,7 +337,8 @@ export function createCounterRenderer(canvas, game) {
         break;
       }
       case 'leaving':
-        if (g.angry) bc.icon = 'emo_angry';
+        if (g.priceLeave) bc.icon = 'emo_money';
+        else if (g.angry) bc.icon = 'emo_angry';
         else if (g.stars >= 5) bc.icon = 'emo_love';
         else if (g.stars === 4) bc.icon = 'emo_yum';
         break;
@@ -368,11 +382,13 @@ export function createCounterRenderer(canvas, game) {
     const L = w.layout, C = L.counter;
     for (const t of w.tables) {
       const busy = !!t.groupId;
-      if (!busy) {
-        bctx.fillStyle = 'rgba(59,47,34,0.25)';
-        bctx.fillRect(t.x - 9, C.top + 5, 18, 7);
-        bctx.fillStyle = t.reserved ? '#ffcf3d' : 'rgba(255,250,240,0.8)';
-        bctx.fillRect(t.x - 8, C.top + 6, 16, 5);
+      if (!busy) {                                   // an empty spot: a little placemat in the counter's style, cup ring on it
+        const pm = MATS[counterMat()] || MATS[0];
+        bctx.fillStyle = 'rgba(40,28,18,0.22)'; bctx.fillRect(t.x - 9, C.top + 6, 18, 6.5);
+        bctx.fillStyle = t.reserved ? '#ffcf3d' : pm.edge; bctx.fillRect(t.x - 8.5, C.top + 5, 17, 6);
+        bctx.fillStyle = t.reserved ? '#ffe08a' : pm.mat; bctx.fillRect(t.x - 7.5, C.top + 5.5, 15, 5);
+        bctx.strokeStyle = pm.ring; bctx.lineWidth = 0.5;
+        bctx.beginPath(); bctx.ellipse(t.x, C.top + 8, 3, 1.4, 0, 0, Math.PI * 2); bctx.stroke();
       }
       if (t.idx === trayTable) {
         const k = 0.5 + 0.5 * Math.sin(time * 6);
@@ -383,23 +399,40 @@ export function createCounterRenderer(canvas, game) {
   }
 
   // ───────────── shop name board (hi-res text) ─────────────
+  const signStyle = () => SIGN_STYLES[(looksNow.facade && looksNow.facade.sign) || 'go'] || SIGN_STYLES.go;
+  // v2.5: the sign hangs from the striped awning at the top of the screen, centred, on two ropes
+  const signL = { sign: null };
+  const sgNow = { x: 0, y: 0, w: 0, h: 0, rope: 0 };
+  function placeSign(L) {
+    const sg = L.sign;
+    if (!sg || !cam.scale) { signL.sign = sg || null; return; }
+    const css = (px) => (px * dpr) / cam.scale;                 // css px → world px
+    sgNow.w = sg.w; sgNow.h = sg.h; sgNow.x = Math.round(L.w / 2 - sg.w / 2 + (looksNow.brand ? 6 : 0));   // stamp + board centred as one
+    sgNow.rope = cam.y0 + css(8);                               // tucked under the awning scallops
+    sgNow.y = Math.round(cam.y0 + css(30));
+    signL.sign = sgNow;
+  }
   function drawBoard(L) {
     const sg = L.sign;
     if (!sg) return;
+    const st = signStyle();
+    const ropeTop = sg.rope != null ? sg.rope : 0, sway = Math.sin(time * 1.2) * 0.25;
     bctx.fillStyle = '#3b2f22';
-    bctx.fillRect(sg.x + 10, 0, 0.5, sg.y + 1); bctx.fillRect(sg.x + sg.w - 10.5, 0, 0.5, sg.y + 1);
-    bctx.fillStyle = '#2e5010'; bctx.fillRect(sg.x - 1, sg.y - 1, sg.w + 2, sg.h + 2);
-    bctx.fillStyle = '#3f6a14'; bctx.fillRect(sg.x, sg.y, sg.w, sg.h);
-    bctx.fillStyle = '#5f9a1a'; bctx.fillRect(sg.x, sg.y, sg.w, 1);
+    bctx.fillRect(sg.x + 10 + sway, ropeTop, 0.5, sg.y + 1 - ropeTop); bctx.fillRect(sg.x + sg.w - 10.5 + sway, ropeTop, 0.5, sg.y + 1 - ropeTop);
+    bctx.fillStyle = '#6b5440'; bctx.fillRect(sg.x + 9.5 + sway, sg.y - 1.5, 1.5, 1.5); bctx.fillRect(sg.x + sg.w - 11 + sway, sg.y - 1.5, 1.5, 1.5);   // rings
+    bctx.fillStyle = st.edge; bctx.fillRect(sg.x - 1, sg.y - 1, sg.w + 2, sg.h + 2);
+    bctx.fillStyle = st.fill; bctx.fillRect(sg.x, sg.y, sg.w, sg.h);
+    bctx.fillStyle = st.hi; bctx.fillRect(sg.x, sg.y, sg.w, 1);
   }
   const fit = { name: '', sc: 0, fonts: false, px: 10, text: '' };
   function drawBoardText(L, s) {
     const sg = L.sign, name = (s.shopName || 'Xoài Lắc Ơi!').trim();
     if (!sg) return;
     const sc = cam.scale;
-    if (fit.name !== name || fit.sc !== sc || fit.fonts !== fontsOK) {
-      fit.name = name; fit.sc = sc; fit.fonts = fontsOK;
-      const maxW = sg.w * sc * 0.9;
+    const pad = looksNow.brand ? 13 : 0;                 // the logo stamp sits on the board's left end
+    if (fit.name !== name || fit.sc !== sc || fit.fonts !== fontsOK || fit.pad !== pad) {
+      fit.name = name; fit.sc = sc; fit.fonts = fontsOK; fit.pad = pad;
+      const maxW = (sg.w - pad) * sc * 0.9;
       let px = Math.round(sg.h * sc * 0.62), txt = name;
       ctx.font = `${px}px ${FONT_BUNGEE}`;
       while (px > 8 && ctx.measureText(txt).width > maxW) { px -= 1; ctx.font = `${px}px ${FONT_BUNGEE}`; }
@@ -409,9 +442,12 @@ export function createCounterRenderer(canvas, game) {
     ctx.font = `${fit.px}px ${FONT_BUNGEE}`;
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.lineJoin = 'round';
     ctx.lineWidth = Math.max(2, Math.round(2 * dpr));
-    const x = Math.round(cam.toDeviceX(sg.x + sg.w / 2)), y = Math.round(cam.toDeviceY(sg.y + sg.h / 2) + fit.px * 0.05);
-    ctx.strokeStyle = '#1d3608'; ctx.strokeText(fit.text, x, y);
-    ctx.fillStyle = '#ffcf3d'; ctx.fillText(fit.text, x, y);
+    const x = Math.round(cam.toDeviceX(sg.x + pad + (sg.w - pad) / 2)), y = Math.round(cam.toDeviceY(sg.y + sg.h / 2) + fit.px * 0.05);
+    const st = signStyle();
+    if (st.glow) { ctx.save(); ctx.shadowColor = st.glow; ctx.shadowBlur = Math.round(fit.px * (0.5 + 0.15 * Math.sin(time * 3))); }
+    ctx.strokeStyle = st.stroke; ctx.strokeText(fit.text, x, y);
+    ctx.fillStyle = st.text; ctx.fillText(fit.text, x, y);
+    if (st.glow) ctx.restore();
   }
 
   // ───────────── the frame ─────────────
@@ -434,38 +470,59 @@ export function createCounterRenderer(canvas, game) {
     fx.update(dt, view);
     let wxNow = s.weather;
     try { if (game.get && game.get.weatherNow) wxNow = game.get.weatherNow(); } catch (e) { /* keep the day's weather */ }
-    const tarpWant = s.today && s.today.tarp ? 1 : 0;
+    const tarpWant = s.today && s.today.tarp ? 1 : 0;   // v2.6.5: from Chợ đêm bờ kè the sim rolls it out by itself
     tarpK += Math.sign(tarpWant - tarpK) * Math.min(Math.abs(tarpWant - tarpK), dt / 0.9);
     amb.update(dt, { x0: view.x0, x1: view.x1, layout: L, clock: s.clock, weather: wxNow, open: s.phase === 'open' });
     const night = nightOf(s.clock);
+    looksNow = activeLooks(s);
+    setUniform(looksNow.uniform);
+    extras.update(dt);
+    extras.clearCups();
 
     bctx.setTransform(DETAIL, 0, 0, DETAIL, -ox * DETAIL, -oy * DETAIL);
     bctx.imageSmoothingEnabled = false;
     drawBackdrop(L);
     drawLights(night);
-    drawBoard(L);
+    extras.drawLamps(bctx, view, LY, s.deco && s.deco.equipped && s.deco.equipped.den, time);
+    if (looksNow.facade) extras.drawBunting(bctx, view, LY, looksNow.facade.bunting, time);
+    placeSign(L);
+    if (looksNow.facade) extras.drawBalloons(bctx, signL, looksNow.facade.balloon, time);
+    drawBoard(signL);
+    extras.drawPlants(bctx, view, s.deco && s.deco.equipped && s.deco.equipped.cay);
 
     // passers-by, the lottery lady, customers — back to front
     drawList.length = 0;
     for (const p of amb.peds) drawList.push(p);
     if (w.veso) drawList.push(w.veso);
     for (const g of w.groups) for (const a of g.members) drawList.push(a);
+    for (const sd of w.side || []) drawList.push(sd);
+    for (const hp of extras.helpers) drawList.push(hp);
+    for (const f of extras.fanSpots((s.upgrades && s.upgrades.cooling) | 0, (w.side || []).filter((x) => !x.bar).length)) drawList.push(f);   // v2.6.20 quạt
     drawList.sort((a, b) => a.y - b.y);
+    const tStyle = (s.upgrades && s.upgrades.tablestyle) || 0;
     const groupOf = new Map();
     for (const g of w.groups) groupOf.set(g.id, g);
     for (const a of drawList) {
+      if (a.fan) { extras.drawFan(bctx, a, time, s.phase !== 'report'); continue; }
+      if (a.home) { extras.drawHelper(bctx, a); continue; }   // staff in the shop's uniform
+      if (a.bar) { extras.drawBar(bctx, a, tStyle, time); continue; }   // v2.5.2 bàn dài sát lan can
+      if (a.seats) {                                   // side table (bàn ghế hai bên quán)
+        drawSideTable(bctx, a, { style: tStyle, pot: a.pot, potFill: a.fill, drinks: a.drinks, plates: a.pot ? 2 : 0, t: time });
+        continue;
+      }
       if (a.look) {                                    // ambient pedestrian
         aOpts.pose = 'walk'; aOpts.facing = a.dir > 0 ? 'right' : 'left'; aOpts.t = a.t; aOpts.carry = null; aOpts.alpha = 1;
         drawChar(bctx, a.look, Math.round(a.x), Math.round(a.y), aOpts);
         continue;
       }
-      const s2 = scaleAt(a.y);
+      const s2 = a.pose === 'sit' ? 1 : scaleAt(a.y);     // seated guests match the (unscaled) side tables
       const sc = s2 > 1.45 ? 1.5 : s2 < 1.04 ? 1 : s2;
       drawActor(a, lookOf(a), sc);
       if (a.memberIdx === 0 && a.groupId) { const g = groupOf.get(a.groupId); if (g) drawCup(g, a, sc); }
     }
 
     drawCounter(L);
+    if (looksNow.facade) extras.drawFlowers(bctx, w, L, looksNow.facade.flower, time);
     let trayTable = -1;
     if (w.tray.ticketId) for (const t of w.tickets) if (t.id === w.tray.ticketId) { trayTable = t.tableIdx; break; }
     if (trayTable < 0 && focusT && focusT.type === 'table') trayTable = focusT.idx;
@@ -478,14 +535,17 @@ export function createCounterRenderer(canvas, game) {
       if (h.t > 0.35 || !h.icon) { handoff.splice(i, 1); continue; }
       const k = h.t / 0.35, y = view.y1 + 4 - (view.y1 + 4 - (L.counter.top - 6)) * (1 - (1 - k) * (1 - k));
       drawIcon(bctx, h.icon, Math.round(h.x - 8), Math.round(y - 8), 1);
+      extras.addCup(Math.round(h.x - 8) + 8, Math.round(y - 8) + 8, 16);
     }
 
-    if (tarpK > 0.01) drawCanopy(bctx, L, tarpK, time);
-    drawWeather(bctx, view, wxNow, time, L.canopy && tarpK > 0.6 ? { x0: L.canopy.x0, y0: L.canopy.yTop, x1: L.canopy.x1, y1: L.canopy.ground } : null);
+    drawWeather(bctx, view, wxNow, time, L.canopy && tarpK > 0.6 ? { x0: L.canopy.x0, y0: Math.round(L.canopy.yTop + (L.canopy.yFront - L.canopy.yTop) * tarpK) + 4, x1: L.canopy.x1, y1: L.canopy.ground } : null, L.counter.top);   // v2.6.5: dry under the tarp (rain still falls beyond its hem) and on the counter
+    if (tarpK > 0.01) drawCanopy(bctx, L, tarpK, time);   // v2.6.5: after the rain, so the showers beyond read as falling behind the sheet
     env.t = time; env.clock = s.clock; env.day = s.day; env.weather = wxNow; env.event = s.event; env.tier = s.tier;
     env.layout = null; env.up = s.upgrades; env.deco = s.deco.equipped; env.open = s.phase === 'open' || s.phase === 'closing';
     drawLighting(bctx, view, env);
     drawGlow(night);
+    if (looksNow.facade) extras.glowLanterns(bctx, view, LY, looksNow.facade.bunting, night);
+    extras.glowLamps(bctx, view, LY, s.deco && s.deco.equipped && s.deco.equipped.den, night);
     drawBubbles(w, trayTable);
     fx.drawParticles(bctx, drawParticle);
 
@@ -495,7 +555,9 @@ export function createCounterRenderer(canvas, game) {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.imageSmoothingEnabled = false;
     ctx.drawImage(buf, 0, 0, bw * DETAIL, bh * DETAIL, shx - Math.round((cam.x0 - ox) * sc), shy - Math.round((cam.y0 - oy) * sc), bw * sc, bh * sc);
-    drawBoardText(L, s);
+    extras.drawSignStamp(ctx, cam, signL, looksNow.brand, s.shopName, shx, shy);
+    drawBoardText(signL, s);
+    extras.drawStamps(ctx, cam, looksNow.brand, s.shopName, night, shx, shy);
     fx.drawText(ctx, cam);
     fx.drawScreen(ctx, canvas.width, canvas.height);
   }

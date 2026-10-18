@@ -3,8 +3,10 @@ import * as C from '../config.js';
 import { h, div, span, ico, setIco, setText, setClass, setStyleVar, setShown, clear, onPress, store, vibrate } from './dom.js';
 import { ctx, S, G, act, sfx } from './ctx.js';
 import { ING, POT, DRINK, stock, ingUnlocked, staffCount } from './data.js';
+import { stampURL } from './looks.js';
+import { activeLooks } from '../core/looks.js';
 
-const KEYS = C.INGREDIENTS.filter((i) => !i.broth);      // broth items get their own row above the tray
+const KEYS = C.INGREDIENTS.filter((i) => !i.broth && !i.side);   // món ăn kèm have their own button      // broth items get their own row above the tray
 const quiet = (name, ...a) => { try { const r = ctx.game.act?.[name]?.(...a); return r || { ok: true }; } catch (e) { console.error('[ui] ' + name, e); return { ok: false }; } };
 
 export function mountDock(root, sceneUi) {
@@ -92,23 +94,23 @@ export function mountDock(root, sceneUi) {
     }
   }
 
-  // ------------------------------------------------------------- broth row
-  // Broth is a kho item like the others (config nl_*): one key per broth on the menu, tap to add it.
-  const brothRow = div('stoves broths');
+  // ------------------------------------------------------------- fruit keys
+  // Fruit is a kho item like the toppings: one key per fruit on the menu, placed first in the (compact) key grid
+  // so the whole dock stays short and the street stays visible.
+  const brothRow = div('keys');                 // the single key grid (fruits first, then unlocked toppings)
   let brothKeys = [], brothSig = '';
   const menuBroths = () => {
     const st = S();
     return C.INGREDIENTS.filter((i) => i.broth && st.menu?.[i.broth] && (ctx.game.get?.isPotUnlocked?.(i.broth) ?? st.level >= i.unlockLv));
   };
   function buildBroths(list) {
-    clear(brothRow); brothKeys = [];
-    brothRow.className = 'stoves broths n' + Math.min(list.length, 7);
+    brothKeys.forEach((r) => r.el.remove()); brothKeys = [];
+    const first = brothRow.firstChild;
     list.forEach((ing) => {
-      const icn = ico(ing.icon, 32, 'sicon'); const name = span('sname', ing.short || ing.name);
-      const sub = span('ssub', ''); const ck = h('i', { class: 'ck kck' });
-      const el = h('button', { class: 'st bt', dataset: { ing: ing.id, tut: 'key-' + ing.id }, 'aria-label': ing.name }, div('sg', icn), div('sl', name, sub), ck);
+      const icn = ico(ing.icon, 32, 'kico'); const sub = span('kc', '0'); const ck = h('i', { class: 'ck kck' });
+      const el = h('button', { class: 'key fruit', dataset: { ing: ing.id, tut: 'key-' + ing.id }, 'aria-label': ing.name, title: ing.name }, icn, sub, ck);
       onPress(el, () => onKey(ing.id, el, icn));
-      brothRow.appendChild(el); brothKeys.push({ id: ing.id, el, icn, sub });
+      brothRow.insertBefore(el, first); brothKeys.push({ id: ing.id, el, icn, sub });
     });
   }
   function updateBroths(info) {
@@ -119,7 +121,7 @@ export function mountDock(root, sceneUi) {
     const hasTray = !!info?.ticket;
     brothKeys.forEach((r) => {
       const n = stock(r.id), nd = need.get(r.id);
-      setText(r.sub, n > 0 ? 'Còn ' + n : 'Hết hàng');
+      setText(r.sub, String(n));
       setClass(r.el, 'zero', n < 1);
       setClass(r.el, 'low', n > 0 && n <= 3);
       setClass(r.el, 'need', !!nd && !nd.done);
@@ -132,7 +134,50 @@ export function mountDock(root, sceneUi) {
   const trayBox = div('tray');
   const trayHead = span('thead', '');
   const traySlots = div('tslots');
+  // v2.6.16 chọn ly / hộp: two key-sized buttons at the end of the topping grid (easy to tap), each with the
+  // container, its stock and the shop's logo stamp once it is designed (Lv 24)
+  const PACKS = [{ id: 'ly_lac', icon: 'sup_lylac', label: 'Ly' }, { id: 'hop_giay', icon: 'sup_hop', label: 'Hộp' }];
+  const packBtns = PACKS.map((p) => {
+    const st = h('img', { class: 'pk-stamp', alt: '', width: 14, height: 14 }); st.hidden = true;
+    const cnt = span('kc', '0');
+    const b = h('button', { class: 'key pack', type: 'button', 'aria-label': 'Đựng bằng ' + p.label.toLowerCase(), title: 'Đựng bằng ' + p.label.toLowerCase() },
+      span('pk-i', ico(p.icon, 32, 'kico'), st), span('pk-l', p.label), cnt);
+    onPress(b, () => {
+      // v2.6.19: with an order on the tray → that order; otherwise → what every new order (staff's too) goes in.
+      // Tapping the chosen kind again goes back to "each dish's own".
+      const info = trayInfo(), t = info?.ticket;
+      let r;
+      if (t && !t.extra && info.box) {
+        r = act('setPack', p.id);
+        if (r && r.ok !== false) act('setPackPref', p.id);
+      } else {
+        const cur = S().packPref || null;
+        r = act('setPackPref', cur === p.id ? null : p.id);
+        if (r && r.ok !== false) ctx.toast(r.packPref ? `Đơn mới đựng bằng ${p.label.toLowerCase()}` : 'Đơn mới đựng theo từng món', 'info', p.icon, 'packpref');
+      }
+      if (r && r.ok === false) { b.classList.remove('shake'); void b.offsetWidth; b.classList.add('shake'); return; }
+      sfx('click'); vibrate(8); tickNow();
+    });
+    b._st = st; b._id = p.id; b._cnt = cnt;
+    b.hidden = true;
+    return b;
+  });
   trayBox.append(trayHead, traySlots);
+  function updatePack(info) {
+    // v2.6.19: always on screen while selling (staff make the orders too); lit = the tray order's container, or the
+    // shop's choice for new orders when nothing is on the tray
+    const t = info?.ticket;
+    const cur = t && !t.extra && info.box ? info.box : (S().packPref || null);
+    packBtns.forEach((b) => { b.hidden = false; });
+    const br = activeLooks(S()).brand, bk = br ? JSON.stringify(br) + S().shopName : '';
+    packBtns.forEach((b) => {
+      setClass(b, 'on', cur === b._id);
+      setText(b._cnt, String(Math.floor(S().supplies?.[b._id] || 0)));
+      setClass(b, 'zero', (S().supplies?.[b._id] || 0) < 1 && cur !== b._id);
+      if (b._st._k !== bk) { b._st._k = bk; if (br) { const u = stampURL(br, 14); if (u) b._st.src = u; else b._st._k = ''; } }
+      b._st.hidden = !br;
+    });
+  }
   let traySig = '';
   const slotEls = {};
   const trayTicket = () => {
@@ -151,11 +196,16 @@ export function mountDock(root, sceneUi) {
       const el = div('slot drk', ico(DRINK[t.drinks[0]]?.icon || 'drk_trada', 16), info.drinks.need > 1 ? span('dn', '×' + info.drinks.need) : null, h('i', { class: 'ck' }));
       slotEls.__drk = el; traySlots.appendChild(el);
     }
+    if (info.sides?.need > 0) {
+      const ids = info.sides.ids;
+      const el = div('slot side', ico(ING[ids[0]]?.icon || 'ak_cavien', 16), ids.length > 1 ? span('dn', '×' + ids.length) : null, h('i', { class: 'ck' }));
+      slotEls.__side = el; traySlots.appendChild(el);
+    }
   }
   function trayInfo() { try { return ctx.game.get?.trayInfo?.() || null; } catch (e) { return null; } }
   function updateTray(info) {
     const t = info?.ticket;
-    const sig = t ? t.id + ':' + (info.need || []).map((n) => n.ing).join('') + ':' + (info.drinks?.need || 0) : 'none';
+    const sig = t ? t.id + ':' + (info.need || []).map((n) => n.ing).join('') + ':' + (info.drinks?.need || 0) + ':' + (info.sides?.ids || []).join('') : 'none';
     if (sig !== traySig) { traySig = sig; buildTray(info); }
     if (!t) {
       const hasNew = (ctx.game.world?.tickets || []).some((x) => x.status === 'new');
@@ -171,13 +221,27 @@ export function mountDock(root, sceneUi) {
       setClass(el, 'zero', !n.done && !n.inStock);
     });
     if (slotEls.__drk) setClass(slotEls.__drk, 'done', info.drinks.done >= info.drinks.need);
+    if (slotEls.__side) setClass(slotEls.__side, 'done', info.sides.done >= info.sides.need);
   }
 
   // ------------------------------------------------------------- actions
   const drinkBtn = h('button', { class: 'btn night body dbtn', dataset: { tut: 'drink-btn' } }, ico('drk_trada', 32, 'dico'), span('dl', 'Nước'));
+  // v2.5 món ăn kèm: shown only while the selected order has one
+  const sideBtn = h('button', { class: 'btn gold body dbtn sbtn', 'aria-label': 'Thêm món ăn kèm' }, ico('ak_cavien', 32, 'dico'), span('dl', 'Ăn kèm'));
+  sideBtn.hidden = true;
+  onPress(sideBtn, () => {
+    const r = act('addSides');
+    if (r.ok !== false) {
+      sfx('pop'); const to = slotEls.__side ? ctx.fx.centerOf(slotEls.__side) : ctx.fx.centerOf(trayBox);
+      const t = trayTicket(); flying.add('__side');
+      ctx.fx.fly(ING[t?.sides?.[0]]?.icon || 'ak_cavien', ctx.fx.centerOf(sideBtn), to, { size: 32, dur: 360, endScale: .6, done: () => { flying.delete('__side'); tickNow(); } });
+    }
+    tickNow();
+  });
   // LẮC! is a hold-to-shake gauge: the ring fills while held, release inside the green zone.
+  const shStamp = h('img', { class: 'sh-stamp', alt: '', width: 18, height: 18 }); shStamp.hidden = true;   // tem logo (Lv 24) on the cup
   const shCup = ico('pot_ga', 32, 'sh-cup'); const shLbl = span('sh-lbl', 'LẮC!'); const shSub = span('sh-sub', 'giữ để lắc');
-  const serveBtn = h('button', { class: 'shaker off', dataset: { tut: 'serve-btn' }, 'aria-label': 'Giữ để lắc' }, div('sh-ring'), div('sh-face', shCup, shLbl), shSub);
+  const serveBtn = h('button', { class: 'shaker off', dataset: { tut: 'serve-btn' }, 'aria-label': 'Giữ để lắc' }, div('sh-ring'), div('sh-face', shCup, shStamp, shLbl), shSub);
   onPress(drinkBtn, () => {
     const r = act('addDrinks');
     if (r.ok !== false) {
@@ -280,17 +344,18 @@ export function mountDock(root, sceneUi) {
   });
 
   // ------------------------------------------------------------- keys
-  const keys = div('keys');
+  const keys = brothRow;
   const keyRefs = {};
   KEYS.forEach((ing) => {
     const icn = ico(ing.icon, 32, 'kico'); const nm = span('kn', ing.short); const cnt = span('kc', '0');
     const lock = div('klock', ico('ui_lock', 16), span('', 'Lv ' + ing.unlockLv));
     const ck = h('i', { class: 'ck kck' });
-    const el = h('button', { class: 'key', dataset: { ing: ing.id, tut: 'key-' + ing.id }, 'aria-label': ing.name }, icn, nm, cnt, ck, lock);
+    const el = h('button', { class: 'key', dataset: { ing: ing.id, tut: 'key-' + ing.id }, 'aria-label': ing.name, title: ing.name }, icn, nm, cnt, ck, lock);
     onPress(el, () => onKey(ing.id, el, icn));
     keys.appendChild(el);
     keyRefs[ing.id] = { el, icn, nm, cnt, lock, ck };
   });
+  packBtns.forEach((b) => keys.appendChild(b));          // v2.6.16 ly / hộp at the end of the grid
   function onKey(id, el, icn) {
     if (!ingUnlocked(id)) { ctx.toast(`${ING[id].name} mở ở Lv ${ING[id].unlockLv} nha.`, 'info', 'ui_lock'); sfx('error'); return; }
     if (stock(id) < 1) { ctx.toast(`Hết ${ING[id].name.toLowerCase()} rồi — mở Kho nhập thêm nha!`, 'bad', ING[id].icon); sfx('error'); return; }
@@ -316,6 +381,7 @@ export function mountDock(root, sceneUi) {
       const r = keyRefs[ing.id]; const un = ingUnlocked(ing.id); const n = stock(ing.id);
       const nd = need.get(ing.id);
       setClass(r.el, 'lock', !un);
+      r.el.hidden = !un;                                  // locked toppings take no room in the compact grid
       setText(r.cnt, un ? n : '');
       setClass(r.el, 'zero', un && n < 1);
       setClass(r.el, 'need', un && !!nd && !nd.done);
@@ -336,10 +402,21 @@ export function mountDock(root, sceneUi) {
       setClass(drinkBtn, 'off', done); setClass(drinkBtn, 'pulse', !done);
       setText(drinkBtn.querySelector('.dl'), done ? 'Xong' : 'Nước');
     }
+    const hasSides = !!t && info.sides?.need > 0;
+    setShown(sideBtn, hasSides);
+    if (hasSides) {
+      setIco(sideBtn.querySelector('.dico'), ING[info.sides.ids[0]]?.icon || 'ak_cavien', 32);
+      const done = info.sides.done >= info.sides.need;
+      setClass(sideBtn, 'off', done); setClass(sideBtn, 'pulse', !done);
+      setText(sideBtn.querySelector('.dl'), done ? 'Xong' : 'Ăn kèm');
+    }
     const can = !!info?.canServe;
     setClass(serveBtn, 'off', !can); setClass(serveBtn, 'ready', can);
     if (t && !t.extra && POT[t.pot]) { if (serveBtn._pot !== t.pot) { serveBtn._pot = t.pot; setIco(shCup, POT[t.pot].icon, 32); } shCup.style.visibility = ''; }
     else shCup.style.visibility = 'hidden';
+    const br = activeLooks(S()).brand, bk = br ? JSON.stringify(br) + S().shopName : '';
+    if (bk !== shStamp._k) { shStamp._k = bk; if (br) { const u = stampURL(br, 18); if (u) shStamp.src = u; else shStamp._k = ''; } }
+    shStamp.hidden = !br || shCup.style.visibility === 'hidden';
     if (can && !hold) setZone(info.zone || [0.58, 0.8]);
     setText(shSub, can ? 'giữ để lắc' : (t ? 'soạn chưa đủ' : 'chọn phiếu'));
   }
@@ -367,8 +444,8 @@ export function mountDock(root, sceneUi) {
   }
 
   // ------------------------------------------------------------- assemble
-  const actionRow = div('arow', trayBox, drinkBtn, serveBtn);
-  lower.append(brothRow, actionRow, keys);
+  const actionRow = div('arow', trayBox, drinkBtn, sideBtn, serveBtn);
+  lower.append(actionRow, keys);
   play.append(toggle, strip, lower);
   root.appendChild(play);
   applyCollapsed();
@@ -384,7 +461,7 @@ export function mountDock(root, sceneUi) {
     const canCollapse = staffCount('daubep') >= 1 && staffCount('phucvu') >= 1;
     toggle.style.display = canCollapse ? '' : 'none';
     if (!canCollapse && collapsed) { collapsed = false; applyCollapsed(); }
-    updateBroths(info); updateTray(info); updateKeys(info); updateActions(info);
+    updateBroths(info); updateTray(info); updatePack(info); updateKeys(info); updateActions(info);
   }
   function update(dt) {
     const open = S().phase === 'open' || S().phase === 'closing';

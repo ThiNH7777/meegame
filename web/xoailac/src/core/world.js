@@ -2,13 +2,13 @@
 import * as C from '../config.js';
 import { getLayout } from '../art/layouts.js';
 import { route, floorOf } from './routing.js';
-import { builtTables, builtStoves } from './economy.js';
+import { builtTables, builtStoves, perkFx } from './economy.js';
 
 export function createWorld(G) {
   return {
     rng: G.rng,
     layout: null,
-    tables: [], stoves: [], groups: [], tickets: [], actors: [],
+    tables: [], stoves: [], groups: [], tickets: [], actors: [], side: [],
     tray: { ticketId: null },   // the player's tray
     owner: null,                // owner actor
     staffActors: new Map(),     // staff id → actor
@@ -63,7 +63,16 @@ export function syncLayout(G, rebuild = false) {
     } else { st.x = ls.x; st.y = ls.y; st.sortY = ls.sortY; }
   }
   w.stoves.length = L.kitchen.stoves.length;
-  const nDoor = Math.min(L.waitSpots.length, C.TIERS[s.tier - 1].waitSpots + (L.counter ? 2 : 0));
+  // side tables (counter view): base + bought, in build order; existing ones keep their group
+  const nSide = Math.min((L.side || []).length, C.SIDE.base + (s.upgrades.sidetable || 0));
+  if (rebuild || !w.side) w.side = [];
+  for (let i = 0; i < nSide; i++) {
+    const ls = L.side[i];
+    if (!w.side[i]) w.side[i] = { idx: i, x: ls.x, y: ls.y, seats: ls.seats, bar: !!ls.bar, groupId: 0, pot: null, fill: 0, drinks: 0 };
+    else { w.side[i].x = ls.x; w.side[i].y = ls.y; w.side[i].seats = ls.seats; w.side[i].bar = !!ls.bar; }
+  }
+  w.side.length = nSide;
+  const nDoor = Math.min(L.waitSpots.length, C.TIERS[s.tier - 1].waitSpots + (L.counter ? 2 : 0) + perkFx(G).queue);
   while (w.doors.length < nDoor) w.doors.push(0);
   w.doors.length = nDoor;
 }
